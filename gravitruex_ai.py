@@ -45,7 +45,7 @@ GPU_FAST_PATH = os.environ.get("GRAVITRUEX_GPU_FAST", "1").strip().lower() not i
 # decisions per episode is reduced to keep the observation buffer in VRAM.
 # More record history reduces truncation: 120k records often ended 1v1 bouts before
 # a kill could occur. At 8-GB GPUs, OOM fallback still lowers the arena batch.
-GPU_ROLLOUT_RECORD_BUDGET = int(os.environ.get("GRAVITRUEX_GPU_RECORD_BUDGET", "360000"))
+GPU_ROLLOUT_RECORD_BUDGET = int(os.environ.get("GRAVITRUEX_GPU_RECORD_BUDGET", "720000"))
 # Independent vectorized environments, not literal CUDA streams. 4096 is a guarded
 # next step for an 8-GB RTX 5060; OOM fallback retries descend to smaller shapes.
 # The larger record budget preserves more decisions per duel (critical for learning to fire).
@@ -53,7 +53,7 @@ GPU_MAX_ARENAS = 4096
 GPU_ARENA_FALLBACK_SIZES = (4096, 3840, 3584, 3328, 3072, 2816, 2560, 2304, 2048, 1792, 1536, 1280, 1024,
                             768, 512, 384, 256, 128, 64, 32, 16, 8, 4, 2, 1)
 APP_CONFIG_VERSION = 1
-APP_BUILD_LABEL = "Stage 6.18 — Rollout Telemetry & Composition Control"
+APP_BUILD_LABEL = "Stage 6.19 — Long Horizon & Adaptive Range"
 DESKTOP_DIAGNOSTIC_FILENAME = "GravitrueX_диагностика.txt"
 
 
@@ -81,6 +81,11 @@ TRAINING_UI_FPS_TARGET = 10
 DT = 1.0 / FPS
 ACTION_REPEAT = 4                 # One policy decision per four physics ticks.
 POLICY_HZ = FPS / ACTION_REPEAT
+HORIZON_CHOICES = ("240 (16 с)", "450 (30 с)", "480 (32 с)", "720 (48 с)", "900 (60 с)",
+                   "960 (64 с)", "1200 (80 с)", "1350 (90 с)", "1800 (120 с)",
+                   "2700 (180 с)", "3600 (240 с)", "5400 (360 с)")
+GPU_RECORD_BUDGET_CHOICES = ("180 000", "360 000", "540 000", "720 000",
+                             "1 440 000", "2 160 000", "2 880 000")
 MAX_SPEED = 205.0
 ACCEL_FORWARD = 235.0
 ACCEL_STRAFE = 195.0
@@ -454,6 +459,14 @@ def visible_test_horizon_reached(start_physics_step: int, current_physics_step: 
     horizon = max(0, int(decision_horizon))
     elapsed = max(0, int(current_physics_step) - int(start_physics_step))
     return elapsed >= horizon * ACTION_REPEAT
+
+
+def parse_decision_horizon(value: object, fallback: int = 2700) -> int:
+    """Parse decision count from values like '2700 (180 с)'; legacy numeric config values remain valid."""
+    match = re.match(r"\s*(\d+)", str(value or ""))
+    if not match:
+        return int(fallback)
+    return int(clamp(int(match.group(1)), 120, 6000))
 
 
 def read_model_meta(model_id: str) -> dict:
@@ -2145,7 +2158,7 @@ def _collect_episode_rollout(policy: ActorCritic, env: Arena, blue_n: int, red_n
             range_factor_after = clamp((1000.0 - distance1) / 800.0, 0.0, 1.0)
             reward += 0.065 * (aim1 - aim0)
             reward += 0.010 * (max(0.0, aim1) ** 2) * range_factor_after
-            if math.isfinite(distance0) and math.isfinite(distance1):
+            if TRAINING_DESIRED_RANGE > 0.0 and math.isfinite(distance0) and math.isfinite(distance1):
                 desired_range = float(TRAINING_DESIRED_RANGE)
                 potential_before = abs(distance0 - desired_range)
                 potential_after = abs(distance1 - desired_range)
@@ -2303,7 +2316,7 @@ def _rollout_worker(task: dict):
     try:
         desired_range = float(task.get("desired_range", old_modes[2]))
         if math.isfinite(desired_range):
-            TRAINING_DESIRED_RANGE = float(clamp(desired_range, 150.0, 1000.0))
+            TRAINING_DESIRED_RANGE = float(clamp(desired_range, 0.0, 1000.0))
     except (TypeError, ValueError):
         pass
     try:
@@ -2327,7 +2340,7 @@ class Trainer(threading.Thread):
                  auto_rollout_balance: bool = False,
                  model_id: str = DEFAULT_MODEL_ID, model_name: str = "Основная модель",
                  opponent_path: Optional[Path] = None, opponent_name: Optional[str] = None,
-                 max_decisions: int = 720, action_priors_mode: str = "soft",
+                 max_decisions: int = 2700, action_priors_mode: str = "soft",
                  reward_mode: str = "baseline", desired_range: float = 480.0,
                  gpu_record_budget: int = GPU_ROLLOUT_RECORD_BUDGET):
         super().__init__(daemon=True, name="GravitrueX-PPO-Trainer")
@@ -2346,7 +2359,7 @@ class Trainer(threading.Thread):
         self._last_cycle_gpu_only_mode = False
         self._batch_gpu_device_seconds = 0.0
         self.gpu_batch_envs = int(clamp(gpu_batch_envs, 1, GPU_MAX_ARENAS))
-        self.gpu_record_budget = int(clamp(int(gpu_record_budget), 60000, 900000))
+        self.gpu_record_budget = int(clamp(int(gpu_record_budget), 60000, 2_880_000))
         self.gpu_rollout_fallback_reason = None
         self._last_gpu_device_seconds = 0.0
         self._last_gpu_host_overhead_seconds = 0.0
@@ -2372,10 +2385,10 @@ class Trainer(threading.Thread):
         self.policy = ActorCritic(seed=int(time.time()) % 1_000_000, width=base_policy.width,
                                   depth=base_policy.depth, device_mode=self.device_mode,
                                   architecture=base_policy.architecture)
-        self.max_decisions = int(clamp(max_decisions, 120, 5000))
+        self.max_decisions = int(clamp(max_decisions, 120, 6000))
         self.action_priors_mode = str(action_priors_mode if action_priors_mode in {"full", "soft", "off"} else "soft")
         self.reward_mode = str(reward_mode if reward_mode in {"baseline", "team"} else "baseline")
-        self.desired_range = float(clamp(float(desired_range), 150.0, 1000.0))
+        self.desired_range = float(clamp(float(desired_range), 0.0, 1000.0))
         self.policy.allow_gpu_inference = self.rollout_gpu_inference or self.gpu_only_rollout
         self.policy.inference_mode = "gpu" if (self.rollout_gpu_inference or self.gpu_only_rollout) else "cpu"
         for k in self.policy.params:

@@ -4619,8 +4619,8 @@ class GravitrueXApp:
             tooltip="Фиксированный размер красной команды в тренировочных аренах (1–5). Для эвристического ИИ или сохранённой модели это количество её кораблей; в self-play — количество кораблей второй команды. Игнорируется, если включены случайные составы.")
         self.training_record_budget_combo = self._make_combo_row(
             right, "Лимит записей GPU", self.train_record_budget,
-            ("180 000", "360 000", "540 000", "720 000"),
-            tooltip="Верхний предел записей опыта за один GPU-rollout. Повышение позволяет использовать больше арен одновременно и может поднять загрузку GPU, особенно при случайных составах или 3–5 кораблях на сторону, но требует больше VRAM. Начинай с 360 000; 540 000/720 000 — экспериментальные значения для 8 ГБ. При нехватке VRAM действует OOM fallback. Длина боя сохраняется; уменьшается реальное число арен, а не горизонт.")
+            GPU_RECORD_BUDGET_CHOICES,
+            tooltip="Максимальный объём опыта на один GPU-rollout. Доступны 720k, 1,44 млн (×2), 2,16 млн (×3), 2,88 млн (×4). Больший бюджет может увеличить фактический батч, но расходует больше VRAM/RAM. На RTX 5060 8 ГБ повышай ступенчато; следи за памятью и OOM fallback. Горизонт сохраняется, уменьшается фактическое число арен.")
         cb = tk.Checkbutton(right, text="Случайные составы 1–5 (вместо выбранных ниже)",
                             variable=self.random_compositions, bg="#0c1929", fg=TEXT,
                             selectcolor="#14283a", activebackground="#0c1929", activeforeground=TEXT,
@@ -4638,12 +4638,12 @@ class GravitrueXApp:
             tooltip=("Выбирает насколько программа вручную подталкивает политику. Мягкие — слабый бонус к наведению/уклонению/стрельбе, рекомендуемый старт. Жёсткие (старые) — сильнее вмешиваются в выбор, включая нижний порог вероятности выстрела в удобном окне; полезно лишь для сравнения. Выключены — решение полностью остаётся сети. Подсказки применяются при обучении и при выборе действий в бою, поэтому тестируй варианты на одинаковых настройках."))
         self.training_range_combo = self._make_combo_row(
             right, "Целевая дистанция, ед.", self.training_desired_range,
-            ("250", "350", "480", "600", "750"),
-            tooltip=("Мягкая цель shaping-награды: PPO получает небольшой бонус, когда сокращает разницу между дистанцией до цели и выбранным значением. Это не автопилот и не жёсткий приказ держать дистанцию. 250 — ближний бой; 350 — близкая дистанция; 480 — текущая базовая цель; 600 — средняя дальность; 750 — более дальняя позиция. Меняй отдельно от награды и priors, иначе трудно понять причину результата."))
+            ("Без целевой дистанции", "250", "350", "480", "600", "750"),
+            tooltip=("«Без целевой дистанции» отключает только явный shaping-бонус за приближение к заданному диапазону. Расстояние остаётся входным признаком, а награда за наведение, стрельбу, урон и победу сохраняется. Это экспериментальный режим: сравни его с 480 при одинаковых seed и настройках. Числовые значения — мягкая цель, не ограничение движения."))
         self.training_horizon_combo = self._make_combo_row(
             right, "Длина тренировочного / тестового боя", self.train_horizon,
-            ("240", "480", "720", "960", "1200"),
-            tooltip=("Максимум решений политики на один бой обучения и на проверочный бой кнопкой «ПРОВЕРИТЬ В БОЮ». Это не физические тики: одно решение удерживается 4 физических тика, поэтому 480 решений ≈ 32 игровых секунд, 720 ≈ 48 с, 1200 ≈ 80 с при непрерывном движении симуляции. Если лимит достигнут до уничтожения команды, это незавершённый бой, не победа и не поражение. CUDA автоматически уменьшает число параллельных арен, чтобы сохранить выбранный горизонт в пределах бюджета записей."))
+            HORIZON_CHOICES,
+            tooltip=("Одно решение удерживается 4 физических тика. При 60 тиках/с: 450=30 с, 900=60 с, 1350=90 с, 1800=120 с, 2700=180 с, 3600=240 с, 5400=360 с. Старые короткие горизонты сохранены. Если бой не завершился за лимит, это unresolved/timeout, не победа и не поражение. Длинный горизонт может снизить число параллельных арен при том же бюджете записей."))
         self._section(right, "Параллелизм обучения")
         rollout_modes = (("CPU: параллельные арены",) if FORCE_CPU else
                          ("CPU: параллельные арены",
@@ -5417,7 +5417,7 @@ class GravitrueXApp:
             self._apply_game_inference_mode()
             self._switch_ui_tab("battle")
             self._new_match()
-            self._visible_test_horizon = int(self.train_horizon.get()) if str(self.train_horizon.get()).isdigit() else 720
+            self._visible_test_horizon = parse_decision_horizon(self.train_horizon.get(), 2700)
             self._test_battle_start_step = int(self.arena.step_count)
             self._test_battle_active = True
             self.episode_label.set(f"Проверочный бой: {blue_display} против {red_display} · лимит {self._visible_test_horizon} решений")
@@ -5526,10 +5526,12 @@ class GravitrueXApp:
             ACTION_PRIORS_MODE = resolved_priors_mode
             TRAINING_REWARD_MODE = resolved_reward_mode
             try:
-                TRAINING_DESIRED_RANGE = float(clamp(float(self.training_desired_range.get()), 150.0, 1000.0))
+                range_choice = str(self.training_desired_range.get()).strip()
+                TRAINING_DESIRED_RANGE = (0.0 if range_choice == "Без целевой дистанции"
+                                          else float(clamp(float(range_choice), 150.0, 1000.0)))
             except (TypeError, ValueError):
                 TRAINING_DESIRED_RANGE = 480.0
-            max_decisions = int(clamp(int(self.train_horizon.get()), 120, 5000))
+            max_decisions = parse_decision_horizon(self.train_horizon.get(), 2700)
             opponent_choice = self.training_opponent.get()
             opponent_path = None
             if opponent_choice == SELFPLAY_LABEL or opponent_choice.startswith("Self-play"):
@@ -5738,8 +5740,8 @@ class GravitrueXApp:
             self.train_gpu_envs_text.set(str(self.train_gpu_envs.get()))
             self.train_blue_n.set(safe_int(training.get("blue_n", 1), 1, 1, 5))
             self.train_red_n.set(safe_int(training.get("red_n", 1), 1, 1, 5))
-            set_choice(self.train_record_budget, training.get("gpu_record_budget", "360 000"),
-                       ("180 000", "360 000", "540 000", "720 000"), "360 000")
+            set_choice(self.train_record_budget, training.get("gpu_record_budget", "720 000"),
+                       GPU_RECORD_BUDGET_CHOICES, "720 000")
             profile = str(training.get("model_profile", self.model_profile.get()))
             self.model_profile.set(profile if profile in ARCH_PROFILES else self.model_profile.get())
             set_choice(self.train_batch, training.get("ppo_batch", "4096"), ("512", "1024", "2048", "4096", "8192"), "4096")
@@ -5750,9 +5752,12 @@ class GravitrueXApp:
             set_choice(self.training_priors_mode, training.get("action_priors_mode", "По профилю модели"),
                        ("По профилю модели", "Мягкие", "Жёсткие (старые)", "Выключены"), "По профилю модели")
             set_choice(self.training_desired_range, training.get("desired_range", "480"),
-                       ("250", "350", "480", "600", "750"), "480")
-            set_choice(self.train_horizon, training.get("max_decisions", "720"),
-                       ("240", "480", "720", "960", "1200"), "720")
+                       ("Без целевой дистанции", "250", "350", "480", "600", "750"), "480")
+            saved_horizon = str(training.get("max_decisions", "2700 (180 с)"))
+            saved_horizon_decisions = parse_decision_horizon(saved_horizon, 2700)
+            self.train_horizon.set(min(
+                HORIZON_CHOICES,
+                key=lambda option: abs(parse_decision_horizon(option, 2700) - saved_horizon_decisions)))
 
             if FORCE_CPU:
                 valid_rollouts = ("CPU: параллельные арены",)

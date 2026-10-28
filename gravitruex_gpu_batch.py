@@ -172,6 +172,21 @@ class GPUVectorArenaBatch:
             self.blue_counts = self.blue_counts[:effective_count].copy()
             self.red_counts = self.red_counts[:effective_count].copy()
         self.E, self.S, self.B = self.count, 10, 256
+        # Keep per-arena counts device-resident before CUDA Graph capture. Building
+        # these from NumPy inside _step() caused implicit CPU->CUDA copies and made
+        # graph capture fail; doing it once also removes two tiny transfers per tick.
+        self._blue_counts_float = torch.as_tensor(
+            self.blue_counts.copy(), dtype=torch.float32, device=self.dev
+        ).view(self.E, 1)
+        self._red_counts_float = torch.as_tensor(
+            self.red_counts.copy(), dtype=torch.float32, device=self.dev
+        ).view(self.E, 1)
+        # In heuristic-opponent mode only blue ships are trainable. Store trajectories
+        # for those slots only instead of all ten world slots; physics/actions stay full-size.
+        self.record_slots = (
+            self.S if self.opponent_mode == "selfplay"
+            else max(1, int(np.max(self.blue_counts)))
+        )
         # Resolve the projectile TTL to a host scalar once, before graph capture.
         # The reusable CUDA tensor prevents an implicit CPU-scalar copy in the
         # advanced indexed assignment used by projectile spawning.
@@ -926,8 +941,8 @@ class GPUVectorArenaBatch:
         reward = reward + reward_cfg["enemy_dead"] * enemy_dead - reward_cfg["ally_dead"] * ally_dead
         blue_team_net = (d_dealt * (self.team == 0).float()).sum(dim=1) - (d_taken * (self.team == 0).float()).sum(dim=1)
         red_team_net = (d_dealt * (self.team == 1).float()).sum(dim=1) - (d_taken * (self.team == 1).float()).sum(dim=1)
-        blue_div = t.as_tensor(self.blue_counts, dtype=t.float32, device=self.dev).view(self.E, 1).clamp_min(1.0)
-        red_div = t.as_tensor(self.red_counts, dtype=t.float32, device=self.dev).view(self.E, 1).clamp_min(1.0)
+        blue_div = self._blue_counts_float.clamp_min(1.0)
+        red_div = self._red_counts_float.clamp_min(1.0)
         team_div = t.where(self.team == 0, blue_div, red_div)
         team_net = t.where(self.team == 0, blue_team_net[:, None], red_team_net[:, None])
         reward = reward + reward_cfg["team_progress"] * team_net / team_div
@@ -1057,6 +1072,7 @@ class GPUVectorArenaBatch:
     def collect(self, stop_event=None):
         t, e = self.t, self.e
         E, S = self.E, self.S
+        R = int(self.record_slots)
         rollout_start = time.perf_counter()
         device = str(self.dev)
         cuda_start = cuda_end = None
@@ -1072,16 +1088,16 @@ class GPUVectorArenaBatch:
         T = self.max_decisions
         # Preallocated per-step storage keeps the rollout copy free of device
         # synchronizations and lets a CUDA graph write straight into it.
-        obs_store = t.zeros((T, E, S, e.OBS_SIZE), dtype=t.float32, device=self.dev)
-        act_store = t.zeros((T, E, S, 4), dtype=t.long, device=self.dev)
-        logp_store = t.zeros((T, E, S), dtype=t.float32, device=self.dev)
-        value_store = t.zeros((T, E, S), dtype=t.float32, device=self.dev)
-        reward_store = t.zeros((T, E, S), dtype=t.float32, device=self.dev)
-        valid_store = t.zeros((T, E, S), dtype=t.bool, device=self.dev)
-        done_store = t.zeros((T, E, S), dtype=t.bool, device=self.dev)
-        teacher_action_store = t.zeros((T, E, S, 4), dtype=t.long, device=self.dev)
+        obs_store = t.zeros((T, E, R, e.OBS_SIZE), dtype=t.float32, device=self.dev)
+        act_store = t.zeros((T, E, R, 4), dtype=t.long, device=self.dev)
+        logp_store = t.zeros((T, E, R), dtype=t.float32, device=self.dev)
+        value_store = t.zeros((T, E, R), dtype=t.float32, device=self.dev)
+        reward_store = t.zeros((T, E, R), dtype=t.float32, device=self.dev)
+        valid_store = t.zeros((T, E, R), dtype=t.bool, device=self.dev)
+        done_store = t.zeros((T, E, R), dtype=t.bool, device=self.dev)
+        teacher_action_store = t.zeros((T, E, R, 4), dtype=t.long, device=self.dev)
         teacher_action_store[..., :3] = 1  # neutral categorical labels by default
-        teacher_mask_store = t.zeros((T, E, S), dtype=t.bool, device=self.dev)
+        teacher_mask_store = t.zeros((T, E, R), dtype=t.bool, device=self.dev)
         # Reuse a graph already captured by diagnostics/tests for this exact batch
         # instance. In normal training each rollout owns a fresh batch, so graph
         # capture still happens once per rollout; avoiding a duplicate capture here
@@ -1119,18 +1135,18 @@ class GPUVectorArenaBatch:
             if horizon:
                 done = done | self.active_env[:, None]
                 self.active_env[:] = False
-            obs_store[decision].copy_(obs)
-            act_store[decision].copy_(acts)
-            logp_store[decision].copy_(logp)
-            value_store[decision].copy_(values)
-            reward_store[decision].copy_(reward)
-            teacher_action_store[decision].copy_(teacher_actions)
+            obs_store[decision].copy_(obs[:, :R])
+            act_store[decision].copy_(acts[:, :R])
+            logp_store[decision].copy_(logp[:, :R])
+            value_store[decision].copy_(values[:, :R])
+            reward_store[decision].copy_(reward[:, :R])
+            teacher_action_store[decision].copy_(teacher_actions[:, :R])
             if self.opponent_mode == "heuristic":
-                teacher_mask_store[decision].copy_(valid & (self.team == 0))
+                teacher_mask_store[decision].copy_(valid[:, :R] & (self.team[:, :R] == 0))
             elif self.opponent_mode == "selfplay":
-                teacher_mask_store[decision].copy_(valid)
-            valid_store[decision].copy_(valid)
-            done_store[decision].copy_(done)
+                teacher_mask_store[decision].copy_(valid[:, :R])
+            valid_store[decision].copy_(valid[:, :R])
+            done_store[decision].copy_(done[:, :R])
             steps_done = decision + 1
         if steps_done == 0:
             return []
@@ -1168,18 +1184,18 @@ class GPUVectorArenaBatch:
         rewards = rewards.clone()
         dones_t = dones_t.clone()
         T_used = rewards.shape[0]
-        time_axis = t.arange(T_used, device=self.dev).view(T_used, 1, 1).expand(T_used, E, S)
+        time_axis = t.arange(T_used, device=self.dev).view(T_used, 1, 1).expand(T_used, E, R)
         last_t_by_ship = t.where(valid_t, time_axis, -1).amax(dim=0)  # [E,S], -1 if no records
         has_record = last_t_by_ship >= 0
-        is_blue = self.team == 0
+        is_blue = self.team[:, :R] == 0
         term_per_ship = t.where(is_blue, terminal_blue[:, None], terminal_red[:, None])
-        blue_div = t.as_tensor(self.blue_counts, dtype=t.float32, device=self.dev).view(E, 1)
-        red_div = t.as_tensor(self.red_counts, dtype=t.float32, device=self.dev).view(E, 1)
+        blue_div = self._blue_counts_float
+        red_div = self._red_counts_float
         divisor = t.where(is_blue, blue_div, red_div).clamp_min(1.0)
         bonus = term_per_ship / divisor * has_record.float()
         last_index = last_t_by_ship.clamp_min(0)
-        env_index = t.arange(E, device=self.dev).view(E, 1).expand(E, S)
-        ship_index = t.arange(S, device=self.dev).view(1, S).expand(E, S)
+        env_index = t.arange(E, device=self.dev).view(E, 1).expand(E, R)
+        ship_index = t.arange(R, device=self.dev).view(1, R).expand(E, R)
         rewards[last_index, env_index, ship_index] = (
             rewards[last_index, env_index, ship_index] + bonus)
         dones_t[last_index, env_index, ship_index] = (

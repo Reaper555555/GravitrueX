@@ -113,6 +113,7 @@ A functional “inner loop” with memory, priorities, simulated affect and shor
 - Hierarchical cortico-basal-ganglia behaviour and memory review: https://pmc.ncbi.nlm.nih.gov/articles/PMC6972576/
 - Survey of LLM-agent memory mechanisms (2025): https://doi.org/10.1145/3748302
 - “Identifying indicators of consciousness in AI systems” (Butlin et al.; 2025/2026): https://doi.org/10.1016/j.tics.2025.10.011
+- Goldenberg & Gross, “Large language models do not have emotions” (Nature Human Behaviour, 24 August 2026; distinguishes emotion-like functions from subjective feeling): https://doi.org/10.1038/s41562-026-02558-6
 - Anthropic, “A global workspace in language models” (6 July 2026): https://www.anthropic.com/research/global-workspace
 - OpenAI, GPT-6 Astra (OpenAI model): https://openai.com/index/gpt-6-astra/
 - Google DeepMind, Project Astra (a separate Google research-assistant project with a similar name): https://deepmind.google/models/project-astra/

@@ -1198,15 +1198,15 @@ class GPUVectorArenaBatch:
             dones_t[last_index, env_index, ship_index] | has_record)
         # Batched GAE over time; done/invalid boundaries prevent leakage across ships.
         adv_t = t.zeros_like(rewards)
-        gae = t.zeros((E, S), dtype=t.float32, device=self.dev)
+        gae = t.zeros((E, R), dtype=t.float32, device=self.dev)
         gamma, lam = .993, .94
         for ti in range(T_used - 1, -1, -1):
             if ti + 1 < T_used:
                 next_valid = valid_t[ti + 1]
                 next_value = value_t[ti + 1]
             else:
-                next_valid = t.zeros((E, S), dtype=t.bool, device=self.dev)
-                next_value = t.zeros((E, S), dtype=t.float32, device=self.dev)
+                next_valid = t.zeros((E, R), dtype=t.bool, device=self.dev)
+                next_value = t.zeros((E, R), dtype=t.float32, device=self.dev)
             nonterminal = (~dones_t[ti]) & next_valid
             delta = rewards[ti] + gamma * next_value * nonterminal.float() - value_t[ti]
             gae = delta + gamma * lam * nonterminal.float() * gae

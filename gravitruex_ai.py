@@ -3652,6 +3652,20 @@ class Trainer(threading.Thread):
             with self.state_lock:
                 if not self.stats.get("message", "").startswith("Ошибка"):
                     self.stats["message"] = "Обучение остановлено. Веса сохранены."
+            # Release allocator-cached blocks that are no longer used by training.
+            # Live policy tensors used by the UI stay resident; empty_cache only frees
+            # unused cached blocks after the final rollout objects have been dropped.
+            try:
+                import gc
+                gc.collect()
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    with self.state_lock:
+                        self.stats.update(cuda_memory_snapshot(torch))
+            except Exception:
+                pass
 
     def _write_training_cycle_log(self, record_count: int, loss: float,
                                   rollout_elapsed: float, ppo_elapsed: float,

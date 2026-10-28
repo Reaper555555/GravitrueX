@@ -441,6 +441,63 @@ def next_gpu_arena_fallback(count: int) -> Optional[int]:
     return next((size for size in GPU_ARENA_FALLBACK_SIZES if size < count), None)
 
 
+def gpu_record_budget_limited_envs(requested_count: int, blue_n: int, red_n: int,
+                                   random_compositions: bool, opponent_mode: str,
+                                   max_decisions: int, max_records: int,
+                                   seed: Optional[int]) -> int:
+    """Predict the exact arena count after the rollout-record budget is applied.
+
+    Uses the same seeded composition sampling order as GPUVectorArenaBatch. This
+    lets OOM recovery shrink the *actual* memory-heavy batch rather than repeatedly
+    retrying with a large request that the record cap reduces to the same shape.
+    """
+    count = max(1, min(GPU_MAX_ARENAS, int(requested_count)))
+    horizon = max(8, int(max_decisions))
+    budget = max(0, int(max_records))
+    if not budget:
+        return count
+    if random_compositions:
+        rng = random.Random(seed if seed is not None else time.time_ns())
+        blue_counts = [rng.randint(1, 5) for _ in range(count)]
+        red_counts = [rng.randint(1, 5) for _ in range(count)]
+    else:
+        blue_counts = [max(1, min(5, int(blue_n)))] * count
+        red_counts = [max(1, min(5, int(red_n)))] * count
+    used = 0
+    effective = 0
+    selfplay = str(opponent_mode) == "selfplay"
+    for blue_count, red_count in zip(blue_counts, red_counts):
+        slots = blue_count + red_count if selfplay else blue_count
+        if (used + slots) * horizon > budget:
+            break
+        used += slots
+        effective += 1
+    return effective
+
+
+def cuda_memory_snapshot(torch_module, device="cuda") -> dict:
+    """Return allocator and driver VRAM metrics without making them a hard dependency."""
+    try:
+        if not torch_module.cuda.is_available():
+            return {}
+        allocated = int(torch_module.cuda.memory_allocated(device))
+        reserved = int(torch_module.cuda.memory_reserved(device))
+        peak_allocated = int(torch_module.cuda.max_memory_allocated(device))
+        peak_reserved = int(torch_module.cuda.max_memory_reserved(device))
+        free_bytes, total_bytes = torch_module.cuda.mem_get_info(device)
+        mib = 1024.0 * 1024.0
+        return {
+            "gpu_cuda_allocated_mb": round(allocated / mib, 1),
+            "gpu_cuda_reserved_mb": round(reserved / mib, 1),
+            "gpu_cuda_peak_allocated_mb": round(peak_allocated / mib, 1),
+            "gpu_cuda_peak_reserved_mb": round(peak_reserved / mib, 1),
+            "gpu_vram_free_mb": round(int(free_bytes) / mib, 1),
+            "gpu_vram_total_mb": round(int(total_bytes) / mib, 1),
+        }
+    except Exception:
+        return {}
+
+
 def is_cuda_oom_error(exc: BaseException) -> bool:
     """Only retry actual device-memory errors; don't mask unrelated training bugs."""
     if type(exc).__name__ == "OutOfMemoryError":

@@ -114,7 +114,8 @@ A functional “inner loop” with memory, priorities, simulated affect and shor
 - Survey of LLM-agent memory mechanisms (2025): https://doi.org/10.1145/3748302
 - “Identifying indicators of consciousness in AI systems” (Butlin et al.; 2025/2026): https://doi.org/10.1016/j.tics.2025.10.011
 - Anthropic, “A global workspace in language models” (6 July 2026): https://www.anthropic.com/research/global-workspace
-- Google DeepMind, Project Astra (clarifies that Astra is a Google research assistant project, not a ChatGPT model): https://deepmind.google/models/project-astra/
+- OpenAI, GPT-6 Astra (OpenAI model): https://openai.com/index/gpt-6-astra/
+- Google DeepMind, Project Astra (a separate Google research-assistant project with a similar name): https://deepmind.google/models/project-astra/
 - Nature commentary “Three reasons why AI is not conscious and perhaps never will be” (19 October 2026): https://www.nature.com/articles/d41586-026-03313-7
 
 ## 8. Decision rule

@@ -1,0 +1,112 @@
+name: Stage 6.19 verification and package
+
+on:
+  push:
+    branches:
+      - stage6-19-long-horizon-no-target-distance
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install runtime and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          python -m pip install --upgrade pip
+          python -m pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Compile current source and tests
+        run: |
+          python -m py_compile gravitruex_ai.py gravitruex_gpu_batch.py test_*.py check_ui_layout_smoke.py
+
+      - name: Prepare clean Stage 6.18 base package with Stage 6.19 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_ZIP="GravitrueX_Neural_Arena_Stage6_18_Rollout_Telemetry_Composition_Control.zip"
+          test -f "$BASE_ZIP"
+          mkdir -p "$RUNNER_TEMP/gravitruex-package" "$GITHUB_WORKSPACE/dist"
+          unzip -q "$BASE_ZIP" -d "$RUNNER_TEMP/gravitruex-package"
+          SOURCE_PATH="$(find "$RUNNER_TEMP/gravitruex-package" -type f -name gravitruex_ai.py -print -quit)"
+          test -n "$SOURCE_PATH"
+          APP_ROOT="$(dirname "$SOURCE_PATH")"
+          cp gravitruex_ai.py "$APP_ROOT/gravitruex_ai.py"
+          cp gravitruex_gpu_batch.py "$APP_ROOT/gravitruex_gpu_batch.py"
+          mkdir -p "$APP_ROOT/tests"
+          for f in test_visible_battle_horizon.py test_gpu_record_budget.py test_config_gpu_batch_limits.py test_model_variants.py test_training_cpu_smoke.py test_training_composition_and_telemetry.py test_training_failure_recovery.py test_teacher_imitation.py test_gpu_only_dispatch.py test_hybrid_orchestration_cpu_backend.py test_hybrid_resource_limits.py test_hybrid_async_cutoff.py test_compare_nonfinite_guard.py test_fire_prior_gpu_battle.py test_desktop_diagnostics_snapshot.py test_battle_hp_shield_hud.py test_training_no_target_distance.py check_ui_layout_smoke.py; do
+            cp "$f" "$APP_ROOT/tests/$f"
+          done
+          echo "$APP_ROOT" > "$RUNNER_TEMP/gravitruex_app_root.txt"
+          echo "APP_ROOT=$APP_ROOT" >> "$GITHUB_ENV"
+
+      - name: Compile packaged application
+        run: |
+          python -m compileall -q "$APP_ROOT"
+
+      - name: Run core regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APP_ROOT"
+          python gravitruex_ai.py --self-test
+          for test in \
+            test_visible_battle_horizon.py \
+            test_config_gpu_batch_limits.py \
+            test_gpu_record_budget.py \
+            test_model_variants.py \
+            test_training_cpu_smoke.py \
+            test_training_composition_and_telemetry.py \
+            test_training_failure_recovery.py \
+            test_teacher_imitation.py \
+            test_gpu_only_dispatch.py \
+            test_hybrid_orchestration_cpu_backend.py \
+            test_hybrid_resource_limits.py \
+            test_hybrid_async_cutoff.py \
+            test_compare_nonfinite_guard.py \
+            test_fire_prior_gpu_battle.py \
+            test_desktop_diagnostics_snapshot.py \
+            test_training_no_target_distance.py; do
+            echo "===== $test ====="
+            python "tests/$test"
+          done
+          xvfb-run -a python tests/test_battle_hp_shield_hud.py
+          xvfb-run -a python tests/check_ui_layout_smoke.py
+
+      - name: Build clean Stage 6.19 ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cd "$APP_ROOT"
+          zip -qr "$GITHUB_WORKSPACE/dist/GravitrueX_Neural_Arena_Stage6_19_Long_Horizon.zip" . \
+            -x "gravitruex_config.json" "GravitrueX/models/*" "GravitrueX/experiments/*" "**/__pycache__/*" "**/*.pyc"
+          test -s "$GITHUB_WORKSPACE/dist/GravitrueX_Neural_Arena_Stage6_19_Long_Horizon.zip"
+          sha256sum "$GITHUB_WORKSPACE/dist/GravitrueX_Neural_Arena_Stage6_19_Long_Horizon.zip"
+
+      - name: Publish tested preview ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view stage6.19-preview >/dev/null 2>&1; then
+            gh release upload stage6.19-preview dist/GravitrueX_Neural_Arena_Stage6_19_Long_Horizon.zip --clobber
+          else
+            gh release create stage6.19-preview dist/GravitrueX_Neural_Arena_Stage6_19_Long_Horizon.zip \
+              --target "$GITHUB_SHA" \
+              --title "GravitrueX Stage 6.19 — Long Horizon & Adaptive Range" \
+              --notes "Preview build. Adds 30–360 second decision-horizon presets (including 180 seconds), GPU rollout record budgets up to 2.88M, optional no-target-distance reward shaping, and cycle reward totals/averages. Published only after the CPU regression suite passes. Actual RTX 5060 CUDA throughput/VRAM is not measured by this runner." \
+              --prerelease
+          fi

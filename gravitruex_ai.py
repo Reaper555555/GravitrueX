@@ -53,7 +53,7 @@ GPU_MAX_ARENAS = 4096
 GPU_ARENA_FALLBACK_SIZES = (4096, 3840, 3584, 3328, 3072, 2816, 2560, 2304, 2048, 1792, 1536, 1280, 1024,
                             768, 512, 384, 256, 128, 64, 32, 16, 8, 4, 2, 1)
 APP_CONFIG_VERSION = 1
-APP_BUILD_LABEL = "Stage 6.19 — Long Horizon & Adaptive Range"
+APP_BUILD_LABEL = "Stage 6.20 — Rollout Memory Optimization"
 DESKTOP_DIAGNOSTIC_FILENAME = "GravitrueX_диагностика.txt"
 
 
@@ -3768,7 +3768,7 @@ class Trainer(threading.Thread):
             f"Устройства отдельно: физика={row['physics_device']} · действия policy={row['policy_inference_device']} · PPO={row['ppo_update_device']}",
             f"Всего: {row['episodes_total']:,} эпизодов · {row['steps_total']:,} физических шагов · обновлений PPO: {update_no}",
             f"Скорость GPU-rollout: {row['gpu_steps_per_sec']:,.0f} шаг/с только во время сбора; скорость полного цикла (сбор {row['rollout_wall_seconds']:.2f}с + PPO {row['ppo_seconds']:.2f}с) {row['end_to_end_steps_per_sec']:,.0f} шаг/с.",
-            f"CPU: {cpu_eps} эп. / {cpu_records:,} записей / {cpu_steps:,} шагов за {cpu_seconds:.2f} с = {cpu_rate:,.0f} шаг/с; процессов {0 if self._last_cycle_gpu_only_mode else (self.cpu_workers_active if self._last_cycle_hybrid_mode else self.workers)}",
+            f"CPU: {cpu_eps} эп. / {cpu_records:,} записей / {cpu_steps:,} шагов за {cpu_seconds:.2f} с = {cpu_rate:,.0f} шаг/с; процессов {0 if self._last_cycle_gpu_only_mode else (int(self.stats.get('cpu_workers_active', self.cpu_workers_active)) if self._last_cycle_hybrid_mode else self.workers)}",
             f"GPU: {gpu_eps} эп. / {gpu_records:,} записей / {gpu_steps:,} шагов за {gpu_seconds:.2f} с = {gpu_rate:,.0f} шаг/с; арен фактически {int(self.stats.get('gpu_rollout_envs', 0) or 0) if (self._last_cycle_hybrid_mode or self._last_cycle_gpu_only_mode) else 0}",
             (f"GPU batch: requested {getattr(self, '_gpu_batch_requested_envs', self.gpu_batch_envs)} → actual {int(self.stats.get('gpu_rollout_envs', 0) or 0)}; record budget {self._last_gpu_record_budget:,}; arenas reduced by record cap {int(self.stats.get('gpu_rollout_envs_budget_reduced', 0) or 0)}; {self._last_gpu_oom_fallback}" if self._last_cycle_hybrid_mode or self._last_cycle_gpu_only_mode else ""),
             (f"Hybrid limits: CPU workers {row['cpu_workers']}/{self.workers}; "
@@ -6755,10 +6755,29 @@ def run_self_test() -> int:
                                         count=2, blue_n=1, red_n=1,
                                         opponent_mode="heuristic", max_decisions=8,
                                         device="cpu", seed=71)
+        assert batch_env.record_slots == 1, f"1v1 heuristic rollout should store one trainable slot, got {batch_env.record_slots}"
+        assert batch_env.blue_count_divisor.device == batch_env.dev
         batch_results = batch_env.collect()
         assert len(batch_results) == 2, f"Expected 2 parallel arenas, got {len(batch_results)}"
         assert all(row[0] and row[5] > 0 for row in batch_results)
         assert all(np.isfinite(float(row[1])) for row in batch_results)
+        # A fixed 2v2 heuristic batch should keep only its two blue training slots,
+        # while retaining full ten-slot physics state.
+        compact_batch = GPUVectorArenaBatch(engine=sys.modules[__name__], policy=batch_policy,
+                                            count=1, blue_n=2, red_n=2,
+                                            opponent_mode="heuristic", max_decisions=8,
+                                            device="cpu", seed=72)
+        compact_results = compact_batch.collect()
+        assert compact_batch.record_slots == 2
+        assert compact_results and len(compact_results[0][0]) > 0
+        # Self-play still stores both teams' experience and keeps the full slot layout.
+        selfplay_batch = GPUVectorArenaBatch(engine=sys.modules[__name__], policy=batch_policy,
+                                             count=1, blue_n=1, red_n=1,
+                                             opponent_mode="selfplay", max_decisions=8,
+                                             device="cpu", seed=73)
+        selfplay_results = selfplay_batch.collect()
+        assert selfplay_batch.record_slots == selfplay_batch.S
+        assert selfplay_results and len(selfplay_results[0][0]) >= 2
         # Regression test: categorical action 2 must produce forward acceleration;
         # neutral action 1 must not be accidentally shifted to reverse thrust.
         batch_env.vx.zero_(); batch_env.vy.zero_(); batch_env.heading.zero_()
@@ -6819,7 +6838,7 @@ def run_self_test() -> int:
                 errors.append(abs(float(getattr(parity_batch, tensor_name)[0, slot].item()) - float(getattr(ship, attr_name))))
         max_error = max(errors) if errors else 0.0
         assert max_error < 1e-3, f"GPU tensor physics diverged from scalar arena by {max_error}"
-        print(f"  OK: {len(batch_results)} arenas in one tensor batch; records={sum(len(row[0]) for row in batch_results):,}; PPO loss={ppo_loss:.4f}")
+        print(f"  OK: {len(batch_results)} 1v1 arenas + {len(compact_results)} compact 2v2 + {len(selfplay_results)} self-play batch; slots=1/2/10; records={sum(len(row[0]) for row in batch_results):,}; PPO loss={ppo_loss:.4f}")
         print(f"  OK: vector physics one-tick parity with scalar Arena; max absolute state error={max_error:.2e}")
     except Exception as exc:
         raise AssertionError(f"GPU vector batch test failed: {exc}") from exc

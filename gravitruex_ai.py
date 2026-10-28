@@ -6707,7 +6707,7 @@ def run_self_test() -> int:
     assert all(np.isfinite(logps)) and all(np.isfinite(values))
     print(f"  OK: {policy.count_params()} параметров, вход {OBS_SIZE}, выходы {arrs.shape}")
 
-    print("[2/6] Проверка арены и наблюдений")
+    print("[3/7] Проверка арены и наблюдений")
     env = Arena(seed=2)
     env.reset(3, 4)
     assert len(env.ships) == 7
@@ -6716,7 +6716,7 @@ def run_self_test() -> int:
         assert o.shape == (OBS_SIZE,) and np.all(np.isfinite(o))
     print(f"  OK: 3 на 4, {OBS_SIZE} признаков на корабль")
 
-    print("[3/6] Фиксированная физика")
+    print("[4/7] Фиксированная физика")
     blue = env.alive_ships(0)
     batch = [env.observation(s) for s in blue]
     acts, _, _, _ = policy.predict_batch(batch, deterministic=True)
@@ -6727,7 +6727,7 @@ def run_self_test() -> int:
     assert all(math.isfinite(s.x) and math.isfinite(s.y) for s in env.ships)
     print(f"  OK: {env.step_count} fixed physics ticks, {len(env.bullets)} projectiles alive")
 
-    print("[4/6] Проверка PPO backprop на синтетическом пакете")
+    print("[5/7] Проверка PPO backprop на синтетическом пакете")
     records = []
     for i in range(32):
         o = np.random.default_rng(i).normal(0, 0.3, OBS_SIZE).astype(np.float32)
@@ -6739,7 +6739,7 @@ def run_self_test() -> int:
     assert math.isfinite(loss)
     print(f"  OK: PPO loss {loss:.4f}; веса обновлены")
 
-    print("[5/6] Проверка self-play и наград за обе команды")
+    print("[6/7] Проверка self-play и наград за обе команды")
     env2 = Arena(seed=33)
     env2.reset(1, 1, seed=33)
     records2, reward2, outcome2, _, _, steps2, metrics2 = _collect_episode_rollout(
@@ -6754,7 +6754,7 @@ def run_self_test() -> int:
     assert red_ship.last_action == given, "self-play red action was overridden by heuristic fallback"
     print(f"  OK: {len(records2)} self-play records; survivor metrics present; both sides' actions accepted")
 
-    print("[6/6] Проверка векторной тензорной физики (CPU backend test; CUDA used by hybrid mode)")
+    print("[7/7] Проверка векторной тензорной физики (CPU backend test; CUDA used by hybrid mode)")
     try:
         import torch
         GPUVectorArenaBatch = _load_gpu_batch_class()

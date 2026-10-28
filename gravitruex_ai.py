@@ -281,6 +281,25 @@ def _available_ram_bytes() -> Optional[int]:
         return None
 
 
+def _cuda_memory_snapshot() -> dict:
+    """Sample PyTorch CUDA allocator counters separately from system VRAM usage."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return {}
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        gib = float(1024 ** 3)
+        return {
+            "allocated_gib": round(float(torch.cuda.memory_allocated()) / gib, 3),
+            "reserved_gib": round(float(torch.cuda.memory_reserved()) / gib, 3),
+            "peak_allocated_gib": round(float(torch.cuda.max_memory_allocated()) / gib, 3),
+            "free_gib": round(float(free_bytes) / gib, 3),
+            "total_gib": round(float(total_bytes) / gib, 3),
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"[:160]}
+
+
 def resolve_hybrid_limits(requested_workers: int, gpu_envs: int,
                           logical_cpus: Optional[int] = None,
                           available_ram_bytes: Optional[int] = None) -> dict:
@@ -303,7 +322,9 @@ def resolve_hybrid_limits(requested_workers: int, gpu_envs: int,
     if available_ram_bytes is not None:
         ram_gb = max(0.0, float(available_ram_bytes) / (1024 ** 3))
         if ram_gb < 1.5:
-            active = min(active, 1)
+            # When <1.5 GiB remain, a CPU sidecar is counterproductive: GPU
+            # rollout also stages packed trajectories through pinned host memory.
+            active = 0
             record_cap = min(record_cap, 4_096)
         elif ram_gb < 3.0:
             active = min(active, 2)
@@ -313,7 +334,7 @@ def resolve_hybrid_limits(requested_workers: int, gpu_envs: int,
             record_cap = min(record_cap, 16_000)
     return {
         "requested_workers": requested,
-        "active_workers": max(1, active),
+        "active_workers": max(0, active),
         "logical_cpus": logical,
         "reserved_logical_cpus": min(reserve, max(0, logical - 1)),
         "available_ram_gb": ram_gb,
@@ -2458,6 +2479,8 @@ class Trainer(threading.Thread):
             "blue_n": fixed_blue, "red_n": fixed_red, "workers": self.workers,
             "cpu_workers_requested": self.workers, "cpu_workers_active": self.cpu_workers_active,
             "hybrid_available_ram_gb": None, "hybrid_cpu_record_cap": 0,
+            "cuda_memory_snapshot": {}, "cuda_memory_snapshot_after_stop": {},
+            "gpu_record_slots": 0, "gpu_obs_history_estimate_gib": 0.0,
             "hybrid_cpu_priority_requested": bool(self.hybrid_gpu_rollout),
             "device": self.device_mode.upper(), "width": self.policy.width, "depth": self.policy.depth,
             "architecture": self.policy.architecture, "max_decisions": self.max_decisions,
@@ -2704,7 +2727,8 @@ class Trainer(threading.Thread):
         while not self.stop_event.is_set():
             gpu_only_this_cycle = bool(self.gpu_only_rollout)
             hybrid_this_cycle = bool(self.hybrid_gpu_rollout)
-            batch_n = self.cpu_workers_active if executor is not None else (0 if gpu_only_this_cycle else 1)
+            batch_n = (self.cpu_workers_active if hybrid_this_cycle and executor is not None
+                       else 0 if (gpu_only_this_cycle or hybrid_this_cycle) else 1)
             self._last_cycle_hybrid_mode = hybrid_this_cycle
             self._last_cycle_gpu_only_mode = gpu_only_this_cycle
             if gpu_only_this_cycle:
@@ -2998,11 +3022,16 @@ class Trainer(threading.Thread):
         cpu_episodes = 0
         cpu_steps = 0
         cpu_collect_started = time.perf_counter()
-        batch_n = self.cpu_workers_active if executor is not None else 0
         available_ram = _available_ram_bytes()
         limits = resolve_hybrid_limits(self.workers, self.gpu_batch_envs,
                                        logical_cpus=os.cpu_count(),
                                        available_ram_bytes=available_ram)
+        pool_capacity = (int(getattr(executor, "_max_workers", self.cpu_workers_active))
+                         if executor is not None else 0)
+        # RAM can fall after startup (especially when the CUDA rollout stages
+        # pinned host buffers). Re-evaluate each cycle and submit only the number
+        # of CPU tasks supported by current headroom, up to the existing pool size.
+        batch_n = min(max(0, pool_capacity), int(limits["active_workers"]))
         max_cpu_records = int(limits["cpu_record_cap"])
         max_cpu_episodes = 64
         self.hybrid_limits = dict(limits)
@@ -3013,13 +3042,14 @@ class Trainer(threading.Thread):
         with self.state_lock:
             self.stats.update({
                 "cpu_workers_requested": int(self.workers),
-                "cpu_workers_active": int(self.cpu_workers_active),
+                "cpu_workers_active": int(batch_n),
                 "hybrid_available_ram_gb": limits["available_ram_gb"],
                 "hybrid_cpu_record_cap": max_cpu_records,
                 "cpu_record_cap_hit": False,
                 "cpu_rejected_over_cap_records": 0,
                 "hybrid_worker_drain_seconds": 0.0,
-                "hybrid_cpu_sidecar_state": "active" if batch_n else "skipped (no worker pool)",
+                "hybrid_cpu_sidecar_state": ("active" if batch_n else
+                                             "disabled (RAM safety floor or no worker pool)"),
             })
         self._last_hybrid_buffer_cap = max_cpu_records
         self._set_phase(
@@ -3457,7 +3487,8 @@ class Trainer(threading.Thread):
             # Load/migrate the latest disk checkpoint before creating shared views.
             self.policy.load(self.save_path)
             self.policy.save(self.save_path)
-            if not self.gpu_only_rollout and (self.workers > 1 or self.hybrid_gpu_rollout):
+            if (not self.gpu_only_rollout and (self.workers > 1 or self.hybrid_gpu_rollout)
+                and not (self.hybrid_gpu_rollout and self.cpu_workers_active <= 0)):
                 try:
                     from multiprocessing import shared_memory
                     ctx = mp.get_context("spawn")
@@ -3554,6 +3585,26 @@ class Trainer(threading.Thread):
                 self._gpu_rollout_executor = None
             try:
                 self.policy.save(self.save_path)
+                # NumPy weights are the durable source of truth. Drop the trainer's
+                # CUDA parameters/optimizer after checkpointing so a stopped session
+                # doesn't keep those live allocations until the window is closed.
+                reset_torch = getattr(self.policy, "_reset_torch_state", None)
+                if callable(reset_torch):
+                    reset_torch()
+                import gc
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                        snapshot_after_stop = _cuda_memory_snapshot()
+                    else:
+                        snapshot_after_stop = {}
+                except Exception:
+                    snapshot_after_stop = {}
+                with self.state_lock:
+                    self.stats["cuda_memory_snapshot_after_stop"] = snapshot_after_stop
                 self._save_stats()
             except Exception:
                 pass

@@ -3376,6 +3376,9 @@ class Trainer(threading.Thread):
                 break
             except Exception as exc:
                 oom = is_cuda_oom_error(exc)
+                memory_snapshot = _cuda_memory_snapshot()
+                with self.state_lock:
+                    self.stats["cuda_memory_snapshot"] = memory_snapshot
                 # If the record budget already reduced the request to e.g. 400 actual
                 # arenas, retrying 4096 -> 3840 recreates the same tensors. On OOM in
                 # collect(), reduce from the effective allocated batch instead.

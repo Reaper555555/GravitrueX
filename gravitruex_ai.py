@@ -53,7 +53,7 @@ GPU_MAX_ARENAS = 4096
 GPU_ARENA_FALLBACK_SIZES = (4096, 3840, 3584, 3328, 3072, 2816, 2560, 2304, 2048, 1792, 1536, 1280, 1024,
                             768, 512, 384, 256, 128, 64, 32, 16, 8, 4, 2, 1)
 APP_CONFIG_VERSION = 1
-APP_BUILD_LABEL = "Stage 6.19 — Long Horizon & Adaptive Range"
+APP_BUILD_LABEL = "Stage 6.20 — Rollout Memory Optimization"
 DESKTOP_DIAGNOSTIC_FILENAME = "GravitrueX_диагностика.txt"
 
 
@@ -281,6 +281,25 @@ def _available_ram_bytes() -> Optional[int]:
         return None
 
 
+def _cuda_memory_snapshot() -> dict:
+    """Sample PyTorch CUDA allocator counters separately from system VRAM usage."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return {}
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        gib = float(1024 ** 3)
+        return {
+            "allocated_gib": round(float(torch.cuda.memory_allocated()) / gib, 3),
+            "reserved_gib": round(float(torch.cuda.memory_reserved()) / gib, 3),
+            "peak_allocated_gib": round(float(torch.cuda.max_memory_allocated()) / gib, 3),
+            "free_gib": round(float(free_bytes) / gib, 3),
+            "total_gib": round(float(total_bytes) / gib, 3),
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"[:160]}
+
+
 def resolve_hybrid_limits(requested_workers: int, gpu_envs: int,
                           logical_cpus: Optional[int] = None,
                           available_ram_bytes: Optional[int] = None) -> dict:
@@ -303,7 +322,9 @@ def resolve_hybrid_limits(requested_workers: int, gpu_envs: int,
     if available_ram_bytes is not None:
         ram_gb = max(0.0, float(available_ram_bytes) / (1024 ** 3))
         if ram_gb < 1.5:
-            active = min(active, 1)
+            # When <1.5 GiB remain, a CPU sidecar is counterproductive: GPU
+            # rollout also stages packed trajectories through pinned host memory.
+            active = 0
             record_cap = min(record_cap, 4_096)
         elif ram_gb < 3.0:
             active = min(active, 2)
@@ -313,7 +334,7 @@ def resolve_hybrid_limits(requested_workers: int, gpu_envs: int,
             record_cap = min(record_cap, 16_000)
     return {
         "requested_workers": requested,
-        "active_workers": max(1, active),
+        "active_workers": max(0, active),
         "logical_cpus": logical,
         "reserved_logical_cpus": min(reserve, max(0, logical - 1)),
         "available_ram_gb": ram_gb,
@@ -2458,6 +2479,8 @@ class Trainer(threading.Thread):
             "blue_n": fixed_blue, "red_n": fixed_red, "workers": self.workers,
             "cpu_workers_requested": self.workers, "cpu_workers_active": self.cpu_workers_active,
             "hybrid_available_ram_gb": None, "hybrid_cpu_record_cap": 0,
+            "cuda_memory_snapshot": {}, "cuda_memory_snapshot_after_stop": {},
+            "gpu_record_slots": 0, "gpu_obs_history_estimate_gib": 0.0,
             "hybrid_cpu_priority_requested": bool(self.hybrid_gpu_rollout),
             "device": self.device_mode.upper(), "width": self.policy.width, "depth": self.policy.depth,
             "architecture": self.policy.architecture, "max_decisions": self.max_decisions,
@@ -2704,7 +2727,8 @@ class Trainer(threading.Thread):
         while not self.stop_event.is_set():
             gpu_only_this_cycle = bool(self.gpu_only_rollout)
             hybrid_this_cycle = bool(self.hybrid_gpu_rollout)
-            batch_n = self.cpu_workers_active if executor is not None else (0 if gpu_only_this_cycle else 1)
+            batch_n = (self.cpu_workers_active if hybrid_this_cycle and executor is not None
+                       else 0 if (gpu_only_this_cycle or hybrid_this_cycle) else 1)
             self._last_cycle_hybrid_mode = hybrid_this_cycle
             self._last_cycle_gpu_only_mode = gpu_only_this_cycle
             if gpu_only_this_cycle:
@@ -2998,11 +3022,16 @@ class Trainer(threading.Thread):
         cpu_episodes = 0
         cpu_steps = 0
         cpu_collect_started = time.perf_counter()
-        batch_n = self.cpu_workers_active if executor is not None else 0
         available_ram = _available_ram_bytes()
         limits = resolve_hybrid_limits(self.workers, self.gpu_batch_envs,
                                        logical_cpus=os.cpu_count(),
                                        available_ram_bytes=available_ram)
+        pool_capacity = (int(getattr(executor, "_max_workers", self.cpu_workers_active))
+                         if executor is not None else 0)
+        # RAM can fall after startup (especially when the CUDA rollout stages
+        # pinned host buffers). Re-evaluate each cycle and submit only the number
+        # of CPU tasks supported by current headroom, up to the existing pool size.
+        batch_n = min(max(0, pool_capacity), int(limits["active_workers"]))
         max_cpu_records = int(limits["cpu_record_cap"])
         max_cpu_episodes = 64
         self.hybrid_limits = dict(limits)
@@ -3013,13 +3042,14 @@ class Trainer(threading.Thread):
         with self.state_lock:
             self.stats.update({
                 "cpu_workers_requested": int(self.workers),
-                "cpu_workers_active": int(self.cpu_workers_active),
+                "cpu_workers_active": int(batch_n),
                 "hybrid_available_ram_gb": limits["available_ram_gb"],
                 "hybrid_cpu_record_cap": max_cpu_records,
                 "cpu_record_cap_hit": False,
                 "cpu_rejected_over_cap_records": 0,
                 "hybrid_worker_drain_seconds": 0.0,
-                "hybrid_cpu_sidecar_state": "active" if batch_n else "skipped (no worker pool)",
+                "hybrid_cpu_sidecar_state": ("active" if batch_n else
+                                             "disabled (RAM safety floor or no worker pool)"),
             })
         self._last_hybrid_buffer_cap = max_cpu_records
         self._set_phase(
@@ -3299,6 +3329,10 @@ class Trainer(threading.Thread):
         self._last_gpu_oom_fallback = ""
         if not torch.cuda.is_available():
             raise RuntimeError("GPU-пакет боёв выбран, но CUDA недоступна. Запусти BAT в режиме NVIDIA CUDA.")
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
         if self.opponent_mode == "model":
             raise RuntimeError("GPU-пакет боёв на этом этапе поддерживает эвристического противника и self-play. Для отдельной модели-противника выбери CPU: параллельные арены.")
         import sys
@@ -3309,6 +3343,9 @@ class Trainer(threading.Thread):
         batch_seed = int(seed if seed is not None else self.rng.randrange(1, 2**31 - 1))
         batch = None
         results = None
+        memory_snapshot = {}
+        record_slots = 0
+        obs_history_gib = 0.0
         while True:
             try:
                 batch_kwargs = dict(
@@ -3328,13 +3365,31 @@ class Trainer(threading.Thread):
                     self.stats["gpu_rollout_envs_requested"] = requested_count
                     self.stats["gpu_rollout_envs_attempted"] = candidate_count
                 results = batch.collect(self.stop_event)
+                memory_snapshot = _cuda_memory_snapshot()
+                record_slots = int(getattr(batch, "record_slots", 10) or 10)
+                obs_history_gib = (
+                    int(getattr(batch, "max_decisions", self.max_decisions))
+                    * int(getattr(batch, "E", candidate_count))
+                    * record_slots * int(getattr(engine, "OBS_SIZE", OBS_SIZE)) * 4
+                    / float(1024 ** 3)
+                )
                 break
             except Exception as exc:
-                next_count = next_gpu_arena_fallback(candidate_count) if is_cuda_oom_error(exc) else None
+                oom = is_cuda_oom_error(exc)
+                memory_snapshot = _cuda_memory_snapshot()
+                with self.state_lock:
+                    self.stats["cuda_memory_snapshot"] = memory_snapshot
+                # If the record budget already reduced the request to e.g. 400 actual
+                # arenas, retrying 4096 -> 3840 recreates the same tensors. On OOM in
+                # collect(), reduce from the effective allocated batch instead.
+                oom_basis = int(getattr(batch, "E", 0) or candidate_count)
+                next_count = next_gpu_arena_fallback(oom_basis) if oom else None
+                if next_count is None and oom_basis != candidate_count:
+                    next_count = next_gpu_arena_fallback(candidate_count)
                 if next_count is None:
                     raise
-                old_count = candidate_count
-                candidate_count = next_count
+                old_count = oom_basis
+                candidate_count = min(next_count, max(1, candidate_count - 1))
                 self.gpu_batch_envs = candidate_count
                 self._last_gpu_oom_fallback = (
                     f"CUDA OOM: {old_count} арен не поместились; пакет автоматически снижен до {candidate_count}.")
@@ -3389,6 +3444,9 @@ class Trainer(threading.Thread):
                 "gpu_rollout_envs_budget_reduced": budget_reduced,
                 "gpu_max_decisions_last": int(getattr(batch, "max_decisions", self.max_decisions)),
                 "gpu_rollout_oom_fallback": self._last_gpu_oom_fallback,
+                "cuda_memory_snapshot": memory_snapshot,
+                "gpu_record_slots": record_slots,
+                "gpu_obs_history_estimate_gib": round(obs_history_gib, 3),
             })
         return results
 
@@ -3457,7 +3515,8 @@ class Trainer(threading.Thread):
             # Load/migrate the latest disk checkpoint before creating shared views.
             self.policy.load(self.save_path)
             self.policy.save(self.save_path)
-            if not self.gpu_only_rollout and (self.workers > 1 or self.hybrid_gpu_rollout):
+            if (not self.gpu_only_rollout and (self.workers > 1 or self.hybrid_gpu_rollout)
+                and not (self.hybrid_gpu_rollout and self.cpu_workers_active <= 0)):
                 try:
                     from multiprocessing import shared_memory
                     ctx = mp.get_context("spawn")
@@ -3554,6 +3613,26 @@ class Trainer(threading.Thread):
                 self._gpu_rollout_executor = None
             try:
                 self.policy.save(self.save_path)
+                # NumPy weights are the durable source of truth. Drop the trainer's
+                # CUDA parameters/optimizer after checkpointing so a stopped session
+                # doesn't keep those live allocations until the window is closed.
+                reset_torch = getattr(self.policy, "_reset_torch_state", None)
+                if callable(reset_torch):
+                    reset_torch()
+                import gc
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                        snapshot_after_stop = _cuda_memory_snapshot()
+                    else:
+                        snapshot_after_stop = {}
+                except Exception:
+                    snapshot_after_stop = {}
+                with self.state_lock:
+                    self.stats["cuda_memory_snapshot_after_stop"] = snapshot_after_stop
                 self._save_stats()
             except Exception:
                 pass
@@ -3603,7 +3682,9 @@ class Trainer(threading.Thread):
             "physics_device": "CUDA" if (self._last_cycle_gpu_only_mode or self._last_cycle_hybrid_mode) else "CPU",
             "policy_inference_device": "CUDA" if (self._last_cycle_gpu_only_mode or self._last_cycle_hybrid_mode or self.rollout_gpu_inference) else "CPU/NumPy",
             "ppo_update_device": str(self.policy.last_device),
-            "cpu_workers": 0 if self._last_cycle_gpu_only_mode else (self.cpu_workers_active if self._last_cycle_hybrid_mode else self.workers),
+            "cpu_workers": 0 if self._last_cycle_gpu_only_mode else (
+                int(self.stats.get("cpu_workers_active", self.cpu_workers_active))
+                if self._last_cycle_hybrid_mode else self.workers),
             "gpu_arenas": int(self.stats.get("gpu_rollout_envs", 0) or 0)
                 if (self._last_cycle_hybrid_mode or self._last_cycle_gpu_only_mode) else 0,
             "cpu_seconds": round(float(cpu_seconds), 4), "cpu_episodes": cpu_eps,
@@ -3639,6 +3720,9 @@ class Trainer(threading.Thread):
             "session_average_steps_per_sec": round(float(self.stats.get("steps_per_sec", 0.0) or 0.0), 2),
             "cpu_buffer_records": int(self._last_hybrid_cpu_records),
             "cpu_buffer_cap": int(self._last_hybrid_buffer_cap),
+            "cuda_memory_snapshot": dict(self.stats.get("cuda_memory_snapshot", {}) or {}),
+            "gpu_record_slots": int(self.stats.get("gpu_record_slots", 0) or 0),
+            "gpu_obs_history_estimate_gib": float(self.stats.get("gpu_obs_history_estimate_gib", 0.0) or 0.0),
             "episodes_total": int(self.stats.get("episodes", 0)),
             "steps_total": int(self.stats.get("steps", 0)),
             "win_rate_20": round(float(self.stats.get("win_rate_20", 0.0)), 4),
@@ -3678,6 +3762,7 @@ class Trainer(threading.Thread):
                 if k in ("time", "model_id", "profile", "gpu_arenas", "gpu_seconds", "gpu_episodes", "gpu_records", "gpu_physics_steps", "gpu_steps_per_sec")})
         append_jsonl(self.ppo_updates_jsonl_path, {k: v for k, v in row.items()
             if k in ("time", "model_id", "profile", "ppo_seconds", "ppo_device", "ppo_records", "minibatch", "epochs", "ppo_loss", "imitation_loss", "imitation_coef")})
+        cuda_mem = dict(row.get("cuda_memory_snapshot", {}) or {})
         lines = [
             "GRAVITRUEX — КРАТКИЙ ОТЧЁТ ОБУЧЕНИЯ",
             f"Время: {stamp}",
@@ -3686,15 +3771,16 @@ class Trainer(threading.Thread):
             f"Устройства отдельно: физика={row['physics_device']} · действия policy={row['policy_inference_device']} · PPO={row['ppo_update_device']}",
             f"Всего: {row['episodes_total']:,} эпизодов · {row['steps_total']:,} физических шагов · обновлений PPO: {update_no}",
             f"Скорость GPU-rollout: {row['gpu_steps_per_sec']:,.0f} шаг/с только во время сбора; скорость полного цикла (сбор {row['rollout_wall_seconds']:.2f}с + PPO {row['ppo_seconds']:.2f}с) {row['end_to_end_steps_per_sec']:,.0f} шаг/с.",
-            f"CPU: {cpu_eps} эп. / {cpu_records:,} записей / {cpu_steps:,} шагов за {cpu_seconds:.2f} с = {cpu_rate:,.0f} шаг/с; процессов {0 if self._last_cycle_gpu_only_mode else (self.cpu_workers_active if self._last_cycle_hybrid_mode else self.workers)}",
+            f"CPU: {cpu_eps} эп. / {cpu_records:,} записей / {cpu_steps:,} шагов за {cpu_seconds:.2f} с = {cpu_rate:,.0f} шаг/с; процессов {0 if self._last_cycle_gpu_only_mode else (int(self.stats.get('cpu_workers_active', self.cpu_workers_active)) if self._last_cycle_hybrid_mode else self.workers)}",
             f"GPU: {gpu_eps} эп. / {gpu_records:,} записей / {gpu_steps:,} шагов за {gpu_seconds:.2f} с = {gpu_rate:,.0f} шаг/с; арен фактически {int(self.stats.get('gpu_rollout_envs', 0) or 0) if (self._last_cycle_hybrid_mode or self._last_cycle_gpu_only_mode) else 0}",
             (f"GPU batch: requested {getattr(self, '_gpu_batch_requested_envs', self.gpu_batch_envs)} → actual {int(self.stats.get('gpu_rollout_envs', 0) or 0)}; record budget {self._last_gpu_record_budget:,}; arenas reduced by record cap {int(self.stats.get('gpu_rollout_envs_budget_reduced', 0) or 0)}; {self._last_gpu_oom_fallback}" if self._last_cycle_hybrid_mode or self._last_cycle_gpu_only_mode else ""),
-            (f"Hybrid limits: CPU workers {self.cpu_workers_active}/{self.workers}; "
+            (f"Hybrid limits: CPU workers {row['cpu_workers']}/{self.workers}; "
              f"RAM available at start {self.hybrid_limits.get('available_ram_gb') if self.hybrid_limits else 'unknown'} GB; "
              f"CPU record cap {self._last_hybrid_buffer_cap:,}; workers low-priority when supported" if self._last_cycle_hybrid_mode else ""),
             (f"Автоограничитель гибрида: {self.auto_rollout_selection_note}" if self.auto_rollout_selection_note else ""),
             f"GPU device timeline: {self._last_gpu_device_seconds:.2f} с; rest (Python dispatch, init, copy/pack): {self._last_gpu_host_overhead_seconds:.2f} с",
             f"CUDA Graph: {'used' if self._last_gpu_graph_used else 'eager'}; requested={self._last_gpu_graph_requested}; {self._last_gpu_graph_error[:200] if self._last_gpu_graph_error else 'no fallback error'}",
+            (f"PyTorch CUDA memory: allocated={cuda_mem.get('allocated_gib', 'n/a')} GiB · reserved={cuda_mem.get('reserved_gib', 'n/a')} GiB · peak allocated={cuda_mem.get('peak_allocated_gib', 'n/a')} GiB · device free/total={cuda_mem.get('free_gib', 'n/a')}/{cuda_mem.get('total_gib', 'n/a')} GiB · history slots/arena={row.get('gpu_record_slots', 0)} · observation history estimate={row.get('gpu_obs_history_estimate_gib', 0):.3f} GiB"),
             f"GPU rollout: арен запрошено {int(self.stats.get('gpu_rollout_envs_requested', 0) or 0)} · реально в батче {int(self.stats.get('gpu_rollout_envs', 0) or 0)} · сокращено лимитом записей {int(self.stats.get('gpu_rollout_envs_budget_reduced', 0) or 0)}; горизонт {self._last_gpu_max_decisions if self._last_gpu_max_decisions else 'не использовался'} решений/арену · record budget {self._last_gpu_record_budget:,}",
             f"Ожидание GPU после завершения CPU-сбора: {cpu_wait_seconds:.2f} с; CPU-буфер {self._last_hybrid_cpu_records:,}/{self._last_hybrid_buffer_cap:,} (строгий лимит; отброшено сверх лимита записей: {int(self.stats.get('cpu_rejected_over_cap_records', 0) or 0)})",
             f"Дренаж CPU-воркеров, не перекрытый PPO: {float(getattr(self, '_last_hybrid_worker_drain_seconds', 0.0)):.3f} с",
@@ -6503,6 +6589,8 @@ class GravitrueXApp:
                 params = getattr(getattr(trainer, "policy", None), "count_params", lambda: 0)()
                 history = list(ts.get("last_two_cycles", []))[-2:]
                 recent_rate_rows = _read_jsonl_tail(getattr(trainer, "metrics_jsonl_path", Path("/nonexistent")), 8)
+                cuda_mem = dict(ts.get("cuda_memory_snapshot", {}) or {})
+                cuda_mem_after_stop = dict(ts.get("cuda_memory_snapshot_after_stop", {}) or {})
                 lines.extend([
                     "[ОБУЧЕНИЕ]",
                     f"Модель={ts.get('training_model_name', getattr(trainer, 'model_name', '?'))} [{model_id}] · архитектура={width}x{depth} · параметры={params:,}",
@@ -6515,6 +6603,7 @@ class GravitrueXApp:
                     f"Throughput: session={float(ts.get('steps_per_sec', 0) or 0):,.0f} phys.step/s · CPU last={float(ts.get('cpu_rollout_steps_per_sec', 0) or 0):,.0f}/s за {float(ts.get('cpu_rollout_sec_last', 0) or 0):.2f}s · GPU last={float(ts.get('gpu_rollout_steps_per_sec', 0) or 0):,.0f}/s за {float(ts.get('gpu_rollout_sec_last', 0) or 0):.2f}s · arenas actual/requested={int(ts.get('gpu_rollout_envs', 0) or 0)}/{int(ts.get('gpu_rollout_envs_requested', 0) or 0)} · horizon={getattr(trainer, '_last_gpu_max_decisions', 0)} · budget={getattr(trainer, '_last_gpu_record_budget', 0):,}",
                     f"Timing: total rollout wall={float(ts.get('rollout_sec_last', 0) or 0):.3f}s · CPU collect={float(ts.get('cpu_rollout_sec_last', 0) or 0):.3f}s · GPU collect={float(ts.get('gpu_rollout_sec_last', 0) or 0):.3f}s (device={float(ts.get('gpu_device_seconds', 0) or 0):.3f}s, host={float(ts.get('gpu_host_overhead_seconds', 0) or 0):.3f}s) · PPO={float(ts.get('ppo_sec_last', 0) or 0):.3f}s · phase={ts.get('phase', 'n/a')}",
                     f"CUDA Graph: {ts.get('gpu_cuda_graph_status', 'not reported')} · OOM fallback: {ts.get('gpu_rollout_oom_fallback', 'none') or 'none'} · budget-reduced arenas={int(ts.get('gpu_rollout_envs_budget_reduced', 0) or 0):,}",
+                    (f"PyTorch CUDA allocator: rollout allocated/reserved/peak={cuda_mem.get('allocated_gib', 'n/a')}/{cuda_mem.get('reserved_gib', 'n/a')}/{cuda_mem.get('peak_allocated_gib', 'n/a')} GiB · free/total={cuda_mem.get('free_gib', 'n/a')}/{cuda_mem.get('total_gib', 'n/a')} GiB · after stop allocated/reserved={cuda_mem_after_stop.get('allocated_gib', 'n/a')}/{cuda_mem_after_stop.get('reserved_gib', 'n/a')} GiB · history slots={int(ts.get('gpu_record_slots', 0) or 0)} · obs buffer estimate={float(ts.get('gpu_obs_history_estimate_gib', 0) or 0):.3f} GiB"),
                     f"Fallback/error: {str(ts.get('message', '') or getattr(trainer, 'fatal_error', '') or 'none')[:500]}",
                     f"Checkpoint={getattr(trainer, 'save_path', 'n/a')} · crash report={getattr(trainer, 'crash_report_path', 'n/a')}",
                     "Последние два цикла (скорость сбора отдельно от полного цикла с PPO):",
@@ -6603,7 +6692,17 @@ class GravitrueXApp:
 
 
 def run_self_test() -> int:
-    print("[1/6] Инициализация политики")
+    print("[1/7] Проверка гибридных лимитов памяти")
+    low_ram = resolve_hybrid_limits(4, 4096, logical_cpus=12,
+                                    available_ram_bytes=int(1.0 * (1024 ** 3)))
+    assert low_ram["active_workers"] == 0, low_ram
+    assert low_ram["cpu_record_cap"] == 4_096, low_ram
+    healthy_ram = resolve_hybrid_limits(4, 400, logical_cpus=12,
+                                        available_ram_bytes=int(8.0 * (1024 ** 3)))
+    assert healthy_ram["active_workers"] >= 1, healthy_ram
+    print(f"  OK: при RAM 1 ГиБ CPU sidecar выключен; при 8 ГиБ доступны {healthy_ram['active_workers']} worker(s)")
+
+    print("[2/7] Инициализация политики")
     policy = ActorCritic(seed=1, width=32, depth=2, device_mode="cpu")
     obs = np.zeros(OBS_SIZE, dtype=np.float32)
     actions, logps, values, arrs = policy.predict_batch([obs, obs], deterministic=False)
@@ -6611,7 +6710,7 @@ def run_self_test() -> int:
     assert all(np.isfinite(logps)) and all(np.isfinite(values))
     print(f"  OK: {policy.count_params()} параметров, вход {OBS_SIZE}, выходы {arrs.shape}")
 
-    print("[2/6] Проверка арены и наблюдений")
+    print("[3/7] Проверка арены и наблюдений")
     env = Arena(seed=2)
     env.reset(3, 4)
     assert len(env.ships) == 7
@@ -6620,7 +6719,7 @@ def run_self_test() -> int:
         assert o.shape == (OBS_SIZE,) and np.all(np.isfinite(o))
     print(f"  OK: 3 на 4, {OBS_SIZE} признаков на корабль")
 
-    print("[3/6] Фиксированная физика")
+    print("[4/7] Фиксированная физика")
     blue = env.alive_ships(0)
     batch = [env.observation(s) for s in blue]
     acts, _, _, _ = policy.predict_batch(batch, deterministic=True)
@@ -6631,7 +6730,7 @@ def run_self_test() -> int:
     assert all(math.isfinite(s.x) and math.isfinite(s.y) for s in env.ships)
     print(f"  OK: {env.step_count} fixed physics ticks, {len(env.bullets)} projectiles alive")
 
-    print("[4/6] Проверка PPO backprop на синтетическом пакете")
+    print("[5/7] Проверка PPO backprop на синтетическом пакете")
     records = []
     for i in range(32):
         o = np.random.default_rng(i).normal(0, 0.3, OBS_SIZE).astype(np.float32)
@@ -6643,7 +6742,7 @@ def run_self_test() -> int:
     assert math.isfinite(loss)
     print(f"  OK: PPO loss {loss:.4f}; веса обновлены")
 
-    print("[5/6] Проверка self-play и наград за обе команды")
+    print("[6/7] Проверка self-play и наград за обе команды")
     env2 = Arena(seed=33)
     env2.reset(1, 1, seed=33)
     records2, reward2, outcome2, _, _, steps2, metrics2 = _collect_episode_rollout(
@@ -6658,7 +6757,7 @@ def run_self_test() -> int:
     assert red_ship.last_action == given, "self-play red action was overridden by heuristic fallback"
     print(f"  OK: {len(records2)} self-play records; survivor metrics present; both sides' actions accepted")
 
-    print("[6/6] Проверка векторной тензорной физики (CPU backend test; CUDA used by hybrid mode)")
+    print("[7/7] Проверка векторной тензорной физики (CPU backend test; CUDA used by hybrid mode)")
     try:
         import torch
         GPUVectorArenaBatch = _load_gpu_batch_class()
@@ -6669,10 +6768,29 @@ def run_self_test() -> int:
                                         count=2, blue_n=1, red_n=1,
                                         opponent_mode="heuristic", max_decisions=8,
                                         device="cpu", seed=71)
+        assert batch_env.record_slots == 1, f"1v1 heuristic rollout should store one trainable slot, got {batch_env.record_slots}"
+        assert batch_env.blue_count_divisor.device == batch_env.dev
         batch_results = batch_env.collect()
         assert len(batch_results) == 2, f"Expected 2 parallel arenas, got {len(batch_results)}"
         assert all(row[0] and row[5] > 0 for row in batch_results)
         assert all(np.isfinite(float(row[1])) for row in batch_results)
+        # A fixed 2v2 heuristic batch should keep only its two blue training slots,
+        # while retaining full ten-slot physics state.
+        compact_batch = GPUVectorArenaBatch(engine=sys.modules[__name__], policy=batch_policy,
+                                            count=1, blue_n=2, red_n=2,
+                                            opponent_mode="heuristic", max_decisions=8,
+                                            device="cpu", seed=72)
+        compact_results = compact_batch.collect()
+        assert compact_batch.record_slots == 2
+        assert compact_results and len(compact_results[0][0]) > 0
+        # Self-play still stores both teams' experience and keeps the full slot layout.
+        selfplay_batch = GPUVectorArenaBatch(engine=sys.modules[__name__], policy=batch_policy,
+                                             count=1, blue_n=1, red_n=1,
+                                             opponent_mode="selfplay", max_decisions=8,
+                                             device="cpu", seed=73)
+        selfplay_results = selfplay_batch.collect()
+        assert selfplay_batch.record_slots == selfplay_batch.S
+        assert selfplay_results and len(selfplay_results[0][0]) >= 2
         # Regression test: categorical action 2 must produce forward acceleration;
         # neutral action 1 must not be accidentally shifted to reverse thrust.
         batch_env.vx.zero_(); batch_env.vy.zero_(); batch_env.heading.zero_()
@@ -6733,7 +6851,7 @@ def run_self_test() -> int:
                 errors.append(abs(float(getattr(parity_batch, tensor_name)[0, slot].item()) - float(getattr(ship, attr_name))))
         max_error = max(errors) if errors else 0.0
         assert max_error < 1e-3, f"GPU tensor physics diverged from scalar arena by {max_error}"
-        print(f"  OK: {len(batch_results)} arenas in one tensor batch; records={sum(len(row[0]) for row in batch_results):,}; PPO loss={ppo_loss:.4f}")
+        print(f"  OK: {len(batch_results)} 1v1 arenas + {len(compact_results)} compact 2v2 + {len(selfplay_results)} self-play batch; slots=1/2/10; records={sum(len(row[0]) for row in batch_results):,}; PPO loss={ppo_loss:.4f}")
         print(f"  OK: vector physics one-tick parity with scalar Arena; max absolute state error={max_error:.2e}")
     except Exception as exc:
         raise AssertionError(f"GPU vector batch test failed: {exc}") from exc

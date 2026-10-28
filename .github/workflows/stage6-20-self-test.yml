@@ -1,0 +1,62 @@
+name: Stage 6.20 self-test
+
+on:
+  push:
+    branches:
+      - stage6-20-rollout-memory-optimization
+  pull_request:
+    branches:
+      - stage6-19-long-horizon-no-target-distance
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install base dependencies
+        run: python -m pip install --upgrade pip numpy psutil
+      - name: Install CPU PyTorch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Compile Python sources
+        run: python -m py_compile gravitruex_ai.py gravitruex_gpu_batch.py
+      - name: Run application self-test
+        run: python gravitruex_ai.py --self-test
+      - name: Prepare patch bundle for the existing installation
+        shell: bash
+        run: |
+          mkdir -p dist/GravitrueX_Stage6_20_Patch
+          cp gravitruex_ai.py gravitruex_gpu_batch.py dist/GravitrueX_Stage6_20_Patch/
+          cat > dist/GravitrueX_Stage6_20_Patch/README_STAGE6_20.txt <<'EOF'
+          GravitrueX — Stage 6.20 Rollout Memory Optimization
+
+          This is a source patch for an existing GravitrueX installation, not a standalone installer.
+          Close the application and make backup copies of:
+            gravitruex_ai.py
+            gravitruex_gpu_batch.py
+
+          Extract the two .py files from this archive into the existing GravitrueX source folder
+          and allow them to replace the old files. Keep your existing launcher, model weights,
+          settings and logs.
+
+          The first run may show lower GPU memory use for training and a CUDA Graph status in the
+          training report. Check the desktop diagnostic TXT after one complete cycle.
+
+          The workflow CPU self-test passed; CUDA performance must still be confirmed on the local
+          NVIDIA GPU.
+          EOF
+      - name: Upload patch archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: GravitrueX_Stage6_20_Patch
+          path: dist/GravitrueX_Stage6_20_Patch/
+          if-no-files-found: error
+          retention-days: 30

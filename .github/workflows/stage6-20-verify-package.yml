@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# Only the newest push may publish a preview asset.
+concurrency:
+  group: stage6-20-preview-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify-and-package:
     runs-on: ubuntu-latest
@@ -90,22 +95,29 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          PACKAGE_NAME="GravitrueX_Neural_Arena_Stage6_20_Performance_Memory_Optimization_${GITHUB_SHA:0:8}.zip"
           cd "$APP_ROOT"
-          zip -qr "$GITHUB_WORKSPACE/dist/GravitrueX_Neural_Arena_Stage6_20_Performance_Memory_Optimization.zip" . \
+          zip -qr "$GITHUB_WORKSPACE/dist/$PACKAGE_NAME" . \
             -x "gravitruex_config.json" "GravitrueX/models/*" "GravitrueX/experiments/*" "**/__pycache__/*" "**/*.pyc"
-          test -s "$GITHUB_WORKSPACE/dist/GravitrueX_Neural_Arena_Stage6_20_Performance_Memory_Optimization.zip"
-          sha256sum "$GITHUB_WORKSPACE/dist/GravitrueX_Neural_Arena_Stage6_20_Performance_Memory_Optimization.zip"
+          test -s "$GITHUB_WORKSPACE/dist/$PACKAGE_NAME"
+          echo "PACKAGE_NAME=$PACKAGE_NAME" >> "$GITHUB_ENV"
+          sha256sum "$GITHUB_WORKSPACE/dist/$PACKAGE_NAME"
 
       - name: Publish tested preview ZIP
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          LATEST_SHA="$(git ls-remote origin "$GITHUB_REF" | awk '{print $1}')"
+          if [ "$LATEST_SHA" != "$GITHUB_SHA" ]; then
+            echo "Skipping publication: a newer commit is already at $GITHUB_REF"
+            exit 0
+          fi
           if gh release view stage6.20-preview >/dev/null 2>&1; then
-            gh release upload stage6.20-preview dist/GravitrueX_Neural_Arena_Stage6_20_Performance_Memory_Optimization.zip --clobber
+            gh release upload stage6.20-preview "dist/$PACKAGE_NAME"
           else
-            gh release create stage6.20-preview dist/GravitrueX_Neural_Arena_Stage6_20_Performance_Memory_Optimization.zip \
+            gh release create stage6.20-preview "dist/$PACKAGE_NAME" \
               --target "$GITHUB_SHA" \
               --title "GravitrueX Stage 6.20 — Performance & Memory Optimization" \
-              --notes "Preview build. Reduces GPU rollout peak memory with trainable-slot-only, dynamically growing trajectory buffers; stores categorical action labels compactly; fixes CUDA-Graph CPU-to-GPU scalar creation in the hot path; retries OOM from the predicted effective batch size; and reports CUDA allocated/reserved/peak/free VRAM. Published only after the CPU regression suite passes. Actual RTX 5060 CUDA throughput/VRAM is not measured by this runner." \
+              --notes "Preview build. Reduces GPU rollout peak memory with compact trainable-slot-only, dynamically growing trajectory buffers; stores categorical action labels compactly; fixes CUDA-Graph CPU-to-GPU scalar creation in the hot path; retries OOM from the predicted effective batch size; releases unused CUDA cache after training stops; and reports CUDA allocated/reserved/peak/free VRAM. Published only after the CPU regression suite passes. Actual RTX 5060 CUDA throughput/VRAM is not measured by this runner." \
               --prerelease
           fi

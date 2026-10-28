@@ -1180,19 +1180,18 @@ class GPUVectorArenaBatch:
         rewards = rewards.clone()
         dones_t = dones_t.clone()
         T_used = rewards.shape[0]
-        time_axis = t.arange(T_used, device=self.dev).view(T_used, 1, 1).expand(T_used, E, S)
-        last_t_by_ship = t.where(valid_t, time_axis, -1).amax(dim=0)  # [E,S], -1 if no records
+        time_axis = t.arange(T_used, device=self.dev).view(T_used, 1, 1).expand(T_used, E, R)
+        last_t_by_ship = t.where(valid_t, time_axis, -1).amax(dim=0)  # [E,R], -1 if no records
         has_record = last_t_by_ship >= 0
-        is_blue = self.team == 0
+        is_blue = self.team[:, :R] == 0
         term_per_ship = t.where(is_blue, terminal_blue[:, None], terminal_red[:, None])
         blue_div = self.blue_count_divisor
         red_div = self.red_count_divisor
-        is_blue = self.team[:, :R] == 0
         divisor = t.where(is_blue, blue_div, red_div).clamp_min(1.0)
         bonus = term_per_ship / divisor * has_record.float()
         last_index = last_t_by_ship.clamp_min(0)
-        env_index = t.arange(E, device=self.dev).view(E, 1).expand(E, S)
-        ship_index = t.arange(S, device=self.dev).view(1, S).expand(E, S)
+        env_index = t.arange(E, device=self.dev).view(E, 1).expand(E, R)
+        ship_index = t.arange(R, device=self.dev).view(1, R).expand(E, R)
         rewards[last_index, env_index, ship_index] = (
             rewards[last_index, env_index, ship_index] + bonus)
         dones_t[last_index, env_index, ship_index] = (

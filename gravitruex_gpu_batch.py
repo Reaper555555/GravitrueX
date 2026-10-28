@@ -187,6 +187,31 @@ class GPUVectorArenaBatch:
             self.S if self.opponent_mode == "selfplay"
             else max(1, int(np.max(self.blue_counts)))
         )
+        # Build a compact, arena-grouped list of only the ships that contribute PPO
+        # records. Random 1-5 compositions used to reserve max_slots for every arena,
+        # even if that arena only had one trainable ship.
+        record_envs = []
+        record_ships = []
+        record_slot_counts = []
+        for env_i in range(self.E):
+            ships = list(range(int(self.blue_counts[env_i])))
+            if self.opponent_mode == "selfplay":
+                ships.extend(range(5, 5 + int(self.red_counts[env_i])))
+            record_slot_counts.append(len(ships))
+            record_envs.extend([env_i] * len(ships))
+            record_ships.extend(ships)
+        self.record_env_indices_np = np.asarray(record_envs, dtype=np.int64)
+        self.record_ship_indices_np = np.asarray(record_ships, dtype=np.int64)
+        self.record_env_offsets = np.concatenate(
+            (np.asarray([0], dtype=np.int64), np.cumsum(record_slot_counts, dtype=np.int64))
+        )
+        self.record_train_slots = int(len(self.record_env_indices_np))
+        self.record_env_index_t = torch.as_tensor(
+            self.record_env_indices_np.copy(), dtype=torch.long, device=self.dev
+        )
+        self.record_ship_index_t = torch.as_tensor(
+            self.record_ship_indices_np.copy(), dtype=torch.long, device=self.dev
+        )
         # Resolve the projectile TTL to a host scalar once, before graph capture.
         # The reusable CUDA tensor prevents an implicit CPU-scalar copy in the
         # advanced indexed assignment used by projectile spawning.
@@ -1076,7 +1101,7 @@ class GPUVectorArenaBatch:
     def collect(self, stop_event=None):
         t, e = self.t, self.e
         E, S = self.E, self.S
-        R = int(self.record_slots)
+        N = int(self.record_train_slots)
         rollout_start = time.perf_counter()
         device = str(self.dev)
         cuda_start = cuda_end = None
@@ -1096,16 +1121,16 @@ class GPUVectorArenaBatch:
         # horizon, so the policy horizon is unchanged and there is no per-step allocation.
         capacity = max(1, min(T, 256))
         stores = {
-            "obs": t.zeros((capacity, E, R, e.OBS_SIZE), dtype=t.float32, device=self.dev),
+            "obs": t.zeros((capacity, N, e.OBS_SIZE), dtype=t.float32, device=self.dev),
             # Action labels are categorical values 0..2 plus fire 0/1; uint8 is enough.
-            "actions": t.zeros((capacity, E, R, 4), dtype=t.uint8, device=self.dev),
-            "logp": t.zeros((capacity, E, R), dtype=t.float32, device=self.dev),
-            "values": t.zeros((capacity, E, R), dtype=t.float32, device=self.dev),
-            "rewards": t.zeros((capacity, E, R), dtype=t.float32, device=self.dev),
-            "valid": t.zeros((capacity, E, R), dtype=t.bool, device=self.dev),
-            "done": t.zeros((capacity, E, R), dtype=t.bool, device=self.dev),
-            "teacher_actions": t.zeros((capacity, E, R, 4), dtype=t.uint8, device=self.dev),
-            "teacher_mask": t.zeros((capacity, E, R), dtype=t.bool, device=self.dev),
+            "actions": t.zeros((capacity, N, 4), dtype=t.uint8, device=self.dev),
+            "logp": t.zeros((capacity, N), dtype=t.float32, device=self.dev),
+            "values": t.zeros((capacity, N), dtype=t.float32, device=self.dev),
+            "rewards": t.zeros((capacity, N), dtype=t.float32, device=self.dev),
+            "valid": t.zeros((capacity, N), dtype=t.bool, device=self.dev),
+            "done": t.zeros((capacity, N), dtype=t.bool, device=self.dev),
+            "teacher_actions": t.zeros((capacity, N, 4), dtype=t.uint8, device=self.dev),
+            "teacher_mask": t.zeros((capacity, N), dtype=t.bool, device=self.dev),
         }
         stores["teacher_actions"][..., :3] = 1  # neutral categorical labels by default
         self.last_record_buffer_capacity = capacity
@@ -1173,18 +1198,18 @@ class GPUVectorArenaBatch:
                 done = done | self.active_env[:, None]
                 self.active_env[:] = False
             ensure_buffer_capacity(decision + 1)
-            stores["obs"][decision].copy_(obs[:, :R])
-            stores["actions"][decision].copy_(acts[:, :R])
-            stores["logp"][decision].copy_(logp[:, :R])
-            stores["values"][decision].copy_(values[:, :R])
-            stores["rewards"][decision].copy_(reward[:, :R])
-            stores["teacher_actions"][decision].copy_(teacher_actions[:, :R])
-            if self.opponent_mode == "heuristic":
-                stores["teacher_mask"][decision].copy_(valid[:, :R] & (self.team[:, :R] == 0))
-            elif self.opponent_mode == "selfplay":
-                stores["teacher_mask"][decision].copy_(valid[:, :R])
-            stores["valid"][decision].copy_(valid[:, :R])
-            stores["done"][decision].copy_(done[:, :R])
+            record_env = self.record_env_index_t
+            record_ship = self.record_ship_index_t
+            record_valid = valid[record_env, record_ship]
+            stores["obs"][decision].copy_(obs[record_env, record_ship])
+            stores["actions"][decision].copy_(acts[record_env, record_ship])
+            stores["logp"][decision].copy_(logp[record_env, record_ship])
+            stores["values"][decision].copy_(values[record_env, record_ship])
+            stores["rewards"][decision].copy_(reward[record_env, record_ship])
+            stores["teacher_actions"][decision].copy_(teacher_actions[record_env, record_ship])
+            stores["teacher_mask"][decision].copy_(record_valid)
+            stores["valid"][decision].copy_(record_valid)
+            stores["done"][decision].copy_(done[record_env, record_ship])
             steps_done = decision + 1
         if steps_done == 0:
             return []
@@ -1218,37 +1243,40 @@ class GPUVectorArenaBatch:
                         + reward_cfg["terminal_bias"])
         terminal_blue = t.where(outcome == 0, reward_cfg["terminal_win"], t.where(outcome == 1, -reward_cfg["terminal_win"], terminal_blue))
         terminal_red = t.where(outcome == 1, reward_cfg["terminal_win"], t.where(outcome == 0, -reward_cfg["terminal_win"], terminal_red))
-        # Add terminal objective to the last reward in each env/team trajectory.
+        # Add terminal objective to the last reward of each recorded ship. The
+        # rollout columns are compact (one column per trainable ship), so map each
+        # column back to its arena/team before applying the terminal term.
         rewards = rewards.clone()
         dones_t = dones_t.clone()
         T_used = rewards.shape[0]
-        time_axis = t.arange(T_used, device=self.dev).view(T_used, 1, 1).expand(T_used, E, R)
-        last_t_by_ship = t.where(valid_t, time_axis, -1).amax(dim=0)  # [E,S], -1 if no records
+        record_env = self.record_env_index_t
+        record_ship = self.record_ship_index_t
+        record_idx = t.arange(N, device=self.dev)
+        time_axis = t.arange(T_used, device=self.dev).view(T_used, 1).expand(T_used, N)
+        last_t_by_ship = t.where(valid_t, time_axis, -1).amax(dim=0)
         has_record = last_t_by_ship >= 0
-        is_blue = self.team[:, :R] == 0
-        term_per_ship = t.where(is_blue, terminal_blue[:, None], terminal_red[:, None])
-        blue_div = self._blue_counts_float
-        red_div = self._red_counts_float
+        is_blue = self.team[record_env, record_ship] == 0
+        term_blue = terminal_blue[record_env]
+        term_red = terminal_red[record_env]
+        term_per_ship = t.where(is_blue, term_blue, term_red)
+        blue_div = self._blue_counts_float.reshape(-1)[record_env]
+        red_div = self._red_counts_float.reshape(-1)[record_env]
         divisor = t.where(is_blue, blue_div, red_div).clamp_min(1.0)
         bonus = term_per_ship / divisor * has_record.float()
         last_index = last_t_by_ship.clamp_min(0)
-        env_index = t.arange(E, device=self.dev).view(E, 1).expand(E, R)
-        ship_index = t.arange(R, device=self.dev).view(1, R).expand(E, R)
-        rewards[last_index, env_index, ship_index] = (
-            rewards[last_index, env_index, ship_index] + bonus)
-        dones_t[last_index, env_index, ship_index] = (
-            dones_t[last_index, env_index, ship_index] | has_record)
-        # Batched GAE over time; done/invalid boundaries prevent leakage across ships.
+        rewards[last_index, record_idx] = rewards[last_index, record_idx] + bonus
+        dones_t[last_index, record_idx] = dones_t[last_index, record_idx] | has_record
+        # GAE is independent for each ship; use compact trainable-slot columns.
         adv_t = t.zeros_like(rewards)
-        gae = t.zeros((E, S), dtype=t.float32, device=self.dev)
+        gae = t.zeros((N,), dtype=t.float32, device=self.dev)
         gamma, lam = .993, .94
         for ti in range(T_used - 1, -1, -1):
             if ti + 1 < T_used:
                 next_valid = valid_t[ti + 1]
                 next_value = value_t[ti + 1]
             else:
-                next_valid = t.zeros((E, S), dtype=t.bool, device=self.dev)
-                next_value = t.zeros((E, S), dtype=t.float32, device=self.dev)
+                next_valid = t.zeros((N,), dtype=t.bool, device=self.dev)
+                next_value = t.zeros((N,), dtype=t.float32, device=self.dev)
             nonterminal = (~dones_t[ti]) & next_valid
             delta = rewards[ti] + gamma * next_value * nonterminal.float() - value_t[ti]
             gae = delta + gamma * lam * nonterminal.float() * gae

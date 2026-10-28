@@ -3366,7 +3366,17 @@ class Trainer(threading.Thread):
         batch_seed = int(seed if seed is not None else self.rng.randrange(1, 2**31 - 1))
         batch = None
         results = None
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
         while True:
+            planned_count = gpu_record_budget_limited_envs(
+                candidate_count, self.fixed_blue, self.fixed_red,
+                self.random_compositions, self.opponent_mode, self.max_decisions,
+                self.gpu_record_budget, batch_seed,
+            )
             try:
                 batch_kwargs = dict(
                     engine=engine, policy=self.policy, count=candidate_count,
@@ -3387,14 +3397,22 @@ class Trainer(threading.Thread):
                 results = batch.collect(self.stop_event)
                 break
             except Exception as exc:
-                next_count = next_gpu_arena_fallback(candidate_count) if is_cuda_oom_error(exc) else None
+                if not is_cuda_oom_error(exc):
+                    raise
+                # The failure can happen after the record budget has already cut a
+                # 4096 request down to a much smaller effective batch. Retry from that
+                # effective count, not from the original request; otherwise we can
+                # repeatedly allocate exactly the same failing tensor shape.
+                old_count = candidate_count
+                failed_effective_count = max(1, int(planned_count or candidate_count))
+                next_count = next_gpu_arena_fallback(min(candidate_count, failed_effective_count))
                 if next_count is None:
                     raise
-                old_count = candidate_count
                 candidate_count = next_count
                 self.gpu_batch_envs = candidate_count
                 self._last_gpu_oom_fallback = (
-                    f"CUDA OOM: {old_count} арен не поместились; пакет автоматически снижен до {candidate_count}.")
+                    f"CUDA OOM: батч после лимита записей ({failed_effective_count} арен, запрос {old_count}) "
+                    f"не поместился; повторяем с запросом {candidate_count}.")
                 self._runtime_log(self._last_gpu_oom_fallback,
                                   f"{type(exc).__name__}: {exc}")
                 with self.state_lock:
@@ -3403,18 +3421,18 @@ class Trainer(threading.Thread):
                         "phase": self._last_gpu_oom_fallback,
                         "gpu_rollout_oom_fallback": self._last_gpu_oom_fallback,
                         "gpu_rollout_envs_requested": requested_count,
+                        "gpu_rollout_envs_attempted": candidate_count,
                         "gpu_rollout_envs": candidate_count,
                     })
                 try:
                     batch = None
+                    import gc
+                    gc.collect()
                     torch.cuda.synchronize()
-                except Exception:
-                    pass
-                try:
                     torch.cuda.empty_cache()
                 except Exception:
                     pass
-                # A fixed batch_seed keeps the randomized setup comparable across retries.
+                # Keep the seed stable so the exact initial composition prefix is reproducible.
         self._batch_gpu_device_seconds = float(getattr(batch, "last_cuda_device_seconds", 0.0) or 0.0)
         self._last_gpu_graph_requested = bool(getattr(batch, "use_cuda_graph", False))
         self._last_gpu_graph_used = bool(getattr(batch, "last_cuda_graph_used", False))
@@ -3446,7 +3464,13 @@ class Trainer(threading.Thread):
                 "gpu_rollout_envs_budget_reduced": budget_reduced,
                 "gpu_max_decisions_last": int(getattr(batch, "max_decisions", self.max_decisions)),
                 "gpu_rollout_oom_fallback": self._last_gpu_oom_fallback,
+                "gpu_rollout_train_slots_stored": int(getattr(batch, "record_slots", 0) or 0),
+                "gpu_rollout_buffer_capacity_decisions": int(getattr(batch, "last_record_buffer_capacity", 0) or 0),
+                "gpu_rollout_buffer_mb": round(
+                    float(getattr(batch, "last_record_store_bytes", 0) or 0) / (1024.0 * 1024.0), 1
+                ),
             })
+            self.stats.update(cuda_memory_snapshot(torch))
         return results
 
     def _make_shared_layout(self):

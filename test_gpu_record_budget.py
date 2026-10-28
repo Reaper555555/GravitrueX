@@ -67,6 +67,13 @@ def main():
         )
         if batch.E != expected:
             raise AssertionError(f"{mode} random composition budget estimate {expected} != batch E {batch.E}")
+        expected_slots = int(sum(batch.blue_counts)) + (
+            int(sum(batch.red_counts)) if mode == "selfplay" else 0
+        )
+        if batch.record_train_slots != expected_slots:
+            raise AssertionError(
+                f"{mode} compact record slots {batch.record_train_slots} != present trainable ships {expected_slots}"
+            )
 
     # Early-ending arenas should not reserve the full max_decisions horizon.
     dynamic = make_batch(2, 2, 2, "heuristic", horizon=720, max_records=10_000)
@@ -76,8 +83,13 @@ def main():
             f"dynamic trajectory buffers should stay below full horizon: "
             f"{dynamic.last_record_buffer_capacity}/{dynamic.max_decisions}"
         )
-    if dynamic.record_slots != 2:
-        raise AssertionError(f"heuristic 2v2 should store two trainable slots, got {dynamic.record_slots}")
+    if dynamic.record_slots != 2 or dynamic.obs_slots.numel() != 2:
+        raise AssertionError(
+            f"heuristic 2v2 should observe/store two blue slots, got "
+            f"record_slots={dynamic.record_slots}, obs_slots={dynamic.obs_slots.numel()}"
+        )
+    if dynamic.record_train_slots != 4:
+        raise AssertionError(f"two 2v2 arenas should have four trainable ship columns, got {dynamic.record_train_slots}")
     if not results or not all(len(row[0]) > 0 for row in results):
         raise AssertionError("dynamic storage returned empty training experiences")
 

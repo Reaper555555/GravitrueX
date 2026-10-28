@@ -6689,7 +6689,17 @@ class GravitrueXApp:
 
 
 def run_self_test() -> int:
-    print("[1/6] Инициализация политики")
+    print("[1/7] Проверка гибридных лимитов памяти")
+    low_ram = resolve_hybrid_limits(4, 4096, logical_cpus=12,
+                                    available_ram_bytes=int(1.0 * (1024 ** 3)))
+    assert low_ram["active_workers"] == 0, low_ram
+    assert low_ram["cpu_record_cap"] == 4_096, low_ram
+    healthy_ram = resolve_hybrid_limits(4, 400, logical_cpus=12,
+                                        available_ram_bytes=int(8.0 * (1024 ** 3)))
+    assert healthy_ram["active_workers"] >= 1, healthy_ram
+    print(f"  OK: при RAM 1 ГиБ CPU sidecar выключен; при 8 ГиБ доступны {healthy_ram['active_workers']} worker(s)")
+
+    print("[2/7] Инициализация политики")
     policy = ActorCritic(seed=1, width=32, depth=2, device_mode="cpu")
     obs = np.zeros(OBS_SIZE, dtype=np.float32)
     actions, logps, values, arrs = policy.predict_batch([obs, obs], deterministic=False)

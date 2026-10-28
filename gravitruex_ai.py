@@ -53,7 +53,7 @@ GPU_MAX_ARENAS = 4096
 GPU_ARENA_FALLBACK_SIZES = (4096, 3840, 3584, 3328, 3072, 2816, 2560, 2304, 2048, 1792, 1536, 1280, 1024,
                             768, 512, 384, 256, 128, 64, 32, 16, 8, 4, 2, 1)
 APP_CONFIG_VERSION = 1
-APP_BUILD_LABEL = "Stage 6.19 — Long Horizon & Adaptive Range"
+APP_BUILD_LABEL = "Stage 6.20 — Performance & Memory Optimization"
 DESKTOP_DIAGNOSTIC_FILENAME = "GravitrueX_диагностика.txt"
 
 
@@ -2533,6 +2533,11 @@ class Trainer(threading.Thread):
             "gpu_device_seconds": 0.0, "gpu_host_overhead_seconds": 0.0,
             "gpu_cuda_graph_requested": False, "gpu_cuda_graph_used": False,
             "gpu_cuda_graph_status": "не проверялся",
+            "gpu_cuda_allocated_mb": 0.0, "gpu_cuda_reserved_mb": 0.0,
+            "gpu_cuda_peak_allocated_mb": 0.0, "gpu_cuda_peak_reserved_mb": 0.0,
+            "gpu_vram_free_mb": 0.0, "gpu_vram_total_mb": 0.0,
+            "gpu_rollout_train_slots_stored": 0, "gpu_rollout_buffer_capacity_decisions": 0,
+            "gpu_rollout_buffer_mb": 0.0,
             "gpu_max_decisions_last": 0, "gpu_record_budget": self.gpu_record_budget,
             "gpu_rollout_envs_requested": self.gpu_batch_envs,
             "gpu_rollout_envs": 0,
@@ -3027,6 +3032,10 @@ class Trainer(threading.Thread):
                 self._save_batches = 0
                 self._last_checkpoint_time = time.monotonic()
             self._save_stats()
+            # Release this cycle's packed rollout arrays before building the next GPU
+            # trajectory buffers. Without explicit release, the previous PPO batch can
+            # remain alive while the next collection allocates its peak-memory buffers.
+            del results, records_for_update, packed_batches, records
 
     def _collect_hybrid_async(self, executor=None):
         """Collect on CPU only while CPU futures can finish before the GPU batch.
@@ -3777,6 +3786,8 @@ class Trainer(threading.Thread):
             f"GPU device timeline: {self._last_gpu_device_seconds:.2f} с; rest (Python dispatch, init, copy/pack): {self._last_gpu_host_overhead_seconds:.2f} с",
             f"CUDA Graph: {'used' if self._last_gpu_graph_used else 'eager'}; requested={self._last_gpu_graph_requested}; {self._last_gpu_graph_error[:200] if self._last_gpu_graph_error else 'no fallback error'}",
             f"GPU rollout: арен запрошено {int(self.stats.get('gpu_rollout_envs_requested', 0) or 0)} · реально в батче {int(self.stats.get('gpu_rollout_envs', 0) or 0)} · сокращено лимитом записей {int(self.stats.get('gpu_rollout_envs_budget_reduced', 0) or 0)}; горизонт {self._last_gpu_max_decisions if self._last_gpu_max_decisions else 'не использовался'} решений/арену · record budget {self._last_gpu_record_budget:,}",
+            f"CUDA allocator MiB: allocated={float(self.stats.get('gpu_cuda_allocated_mb', 0) or 0):.0f} · reserved={float(self.stats.get('gpu_cuda_reserved_mb', 0) or 0):.0f} · peak allocated={float(self.stats.get('gpu_cuda_peak_allocated_mb', 0) or 0):.0f} · driver free={float(self.stats.get('gpu_vram_free_mb', 0) or 0):.0f}/{float(self.stats.get('gpu_vram_total_mb', 0) or 0):.0f}",
+            f"Rollout buffers: {int(self.stats.get('gpu_rollout_train_slots_stored', 0) or 0)} training slots · capacity={int(self.stats.get('gpu_rollout_buffer_capacity_decisions', 0) or 0)} decisions · {float(self.stats.get('gpu_rollout_buffer_mb', 0) or 0):.1f} MiB allocated trajectory storage",
             f"Ожидание GPU после завершения CPU-сбора: {cpu_wait_seconds:.2f} с; CPU-буфер {self._last_hybrid_cpu_records:,}/{self._last_hybrid_buffer_cap:,} (строгий лимит; отброшено сверх лимита записей: {int(self.stats.get('cpu_rejected_over_cap_records', 0) or 0)})",
             f"Дренаж CPU-воркеров, не перекрытый PPO: {float(getattr(self, '_last_hybrid_worker_drain_seconds', 0.0)):.3f} с",
             f"PPO: записей {record_count:,} · mini-batch {self.batch_size:,} · эпох {self.epochs} · loss {loss:.5f}",
@@ -6596,6 +6607,7 @@ class GravitrueXApp:
                     f"Throughput: session={float(ts.get('steps_per_sec', 0) or 0):,.0f} phys.step/s · CPU last={float(ts.get('cpu_rollout_steps_per_sec', 0) or 0):,.0f}/s за {float(ts.get('cpu_rollout_sec_last', 0) or 0):.2f}s · GPU last={float(ts.get('gpu_rollout_steps_per_sec', 0) or 0):,.0f}/s за {float(ts.get('gpu_rollout_sec_last', 0) or 0):.2f}s · arenas actual/requested={int(ts.get('gpu_rollout_envs', 0) or 0)}/{int(ts.get('gpu_rollout_envs_requested', 0) or 0)} · horizon={getattr(trainer, '_last_gpu_max_decisions', 0)} · budget={getattr(trainer, '_last_gpu_record_budget', 0):,}",
                     f"Timing: total rollout wall={float(ts.get('rollout_sec_last', 0) or 0):.3f}s · CPU collect={float(ts.get('cpu_rollout_sec_last', 0) or 0):.3f}s · GPU collect={float(ts.get('gpu_rollout_sec_last', 0) or 0):.3f}s (device={float(ts.get('gpu_device_seconds', 0) or 0):.3f}s, host={float(ts.get('gpu_host_overhead_seconds', 0) or 0):.3f}s) · PPO={float(ts.get('ppo_sec_last', 0) or 0):.3f}s · phase={ts.get('phase', 'n/a')}",
                     f"CUDA Graph: {ts.get('gpu_cuda_graph_status', 'not reported')} · OOM fallback: {ts.get('gpu_rollout_oom_fallback', 'none') or 'none'} · budget-reduced arenas={int(ts.get('gpu_rollout_envs_budget_reduced', 0) or 0):,}",
+                    f"CUDA memory MiB: allocated={float(ts.get('gpu_cuda_allocated_mb', 0) or 0):.0f} · reserved={float(ts.get('gpu_cuda_reserved_mb', 0) or 0):.0f} · peak={float(ts.get('gpu_cuda_peak_allocated_mb', 0) or 0):.0f} · driver free={float(ts.get('gpu_vram_free_mb', 0) or 0):.0f}/{float(ts.get('gpu_vram_total_mb', 0) or 0):.0f} · record buffer={float(ts.get('gpu_rollout_buffer_mb', 0) or 0):.0f} MiB, slots={int(ts.get('gpu_rollout_train_slots_stored', 0) or 0)}, capacity={int(ts.get('gpu_rollout_buffer_capacity_decisions', 0) or 0)} decisions",
                     f"Fallback/error: {str(ts.get('message', '') or getattr(trainer, 'fatal_error', '') or 'none')[:500]}",
                     f"Checkpoint={getattr(trainer, 'save_path', 'n/a')} · crash report={getattr(trainer, 'crash_report_path', 'n/a')}",
                     "Последние два цикла (скорость сбора отдельно от полного цикла с PPO):",

@@ -338,7 +338,11 @@ class GPUVectorArenaBatch:
         self._identity = t.eye(S, dtype=t.bool, device=dev).view(1, S, S)
         # Slots that need an observation vector. In heuristic mode only the blue
         # ships are trained, so the enemy observations were pure waste.
-        if self.blue_only_observations:
+        if self.blue_only_observations and self.opponent_mode != "selfplay":
+            # A fixed 1v1/2v2/3v3 heuristic matchup does not need observations for
+            # absent blue slots; avoid computing all five blue feature vectors.
+            self.obs_slots = t.arange(max(1, min(5, self.record_slots)), device=dev)
+        elif self.blue_only_observations:
             self.obs_slots = t.arange(5, device=dev)
         else:
             self.obs_slots = t.arange(S, device=dev)

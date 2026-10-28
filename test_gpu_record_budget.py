@@ -8,13 +8,26 @@ sys.path.insert(0, str(ROOT))
 import gravitruex_ai as G
 
 
-def make_batch(count: int, blue: int, red: int, mode: str, horizon: int = 480):
+def make_batch(count: int, blue: int, red: int, mode: str, horizon: int = 480,
+               random_compositions: bool = False, max_records: int = 120_000, seed: int = 77):
     policy = G.ActorCritic(seed=100 + count + blue + red, width=32, depth=2, device_mode="cpu")
     batch_cls = G._load_gpu_batch_class()
     batch = batch_cls(engine=G, policy=policy, count=count, blue_n=blue, red_n=red,
-                      opponent_mode=mode, max_decisions=horizon, device="cpu", seed=77,
-                      use_cuda_graph=False, max_records=120_000)
+                      random_compositions=random_compositions,
+                      opponent_mode=mode, max_decisions=horizon, device="cpu", seed=seed,
+                      use_cuda_graph=False, max_records=max_records)
     return batch
+
+
+class StopAfterChecks:
+    """A tiny stand-in for threading.Event that interrupts long tests deterministically."""
+    def __init__(self, checks: int):
+        self.checks = int(checks)
+        self.calls = 0
+
+    def is_set(self) -> bool:
+        self.calls += 1
+        return self.calls > self.checks
 
 
 def main():
@@ -43,9 +56,36 @@ def main():
             raise AssertionError(f"{label}: record cap exceeded: {upper_bound}")
         if batch.max_decisions != expected_horizon:
             raise AssertionError(f"{label}: requested horizon {expected_horizon} was changed to {batch.max_decisions}")
-    print("GPU RECORD BUDGET PASSED")
+    # The preflight calculation must match the exact seeded composition sampling
+    # performed by GPUVectorArenaBatch, otherwise OOM retries can repeat the same
+    # overlarge effective tensor shape many times.
+    for mode, trained_slots in (("heuristic", 1), ("selfplay", 2)):
+        batch = make_batch(100, 1, 1, mode, horizon=480, random_compositions=True,
+                           max_records=120_000, seed=77)
+        expected = G.gpu_record_budget_limited_envs(
+            100, 1, 1, True, mode, 480, 120_000, 77
+        )
+        if batch.E != expected:
+            raise AssertionError(f"{mode} random composition budget estimate {expected} != batch E {batch.E}")
+
+    # Early-ending arenas should not reserve the full max_decisions horizon.
+    dynamic = make_batch(2, 2, 2, "heuristic", horizon=720, max_records=10_000)
+    results = dynamic.collect(StopAfterChecks(300))
+    if not 0 < dynamic.last_record_buffer_capacity < dynamic.max_decisions:
+        raise AssertionError(
+            f"dynamic trajectory buffers should stay below full horizon: "
+            f"{dynamic.last_record_buffer_capacity}/{dynamic.max_decisions}"
+        )
+    if dynamic.record_slots != 2:
+        raise AssertionError(f"heuristic 2v2 should store two trainable slots, got {dynamic.record_slots}")
+    if not results or not all(len(row[0]) > 0 for row in results):
+        raise AssertionError("dynamic storage returned empty training experiences")
+
+    print("GPU RECORD BUDGET / DYNAMIC STORAGE PASSED")
     for batch, slots, expected_horizon, label in cases:
         print(f"{label}: {batch.E}/{batch.requested_count} arenas, {batch.max_decisions} decisions, upper-bound records {batch.max_decisions*batch.E*slots:,}")
+    print(f"dynamic buffer: {dynamic.last_record_buffer_capacity}/{dynamic.max_decisions} decisions, "
+          f"{dynamic.record_slots} trainable slots, {dynamic.last_record_store_bytes:,} bytes")
 
 
 if __name__ == "__main__":

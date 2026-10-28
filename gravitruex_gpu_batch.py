@@ -1086,18 +1086,51 @@ class GPUVectorArenaBatch:
         self.policy.last_device = f"GPU vector rollout / {device} / {self.E} arenas"
         self.policy.last_inference_backend = "CUDA / vectorized battles"
         T = self.max_decisions
-        # Preallocated per-step storage keeps the rollout copy free of device
-        # synchronizations and lets a CUDA graph write straight into it.
-        obs_store = t.zeros((T, E, R, e.OBS_SIZE), dtype=t.float32, device=self.dev)
-        act_store = t.zeros((T, E, R, 4), dtype=t.long, device=self.dev)
-        logp_store = t.zeros((T, E, R), dtype=t.float32, device=self.dev)
-        value_store = t.zeros((T, E, R), dtype=t.float32, device=self.dev)
-        reward_store = t.zeros((T, E, R), dtype=t.float32, device=self.dev)
-        valid_store = t.zeros((T, E, R), dtype=t.bool, device=self.dev)
-        done_store = t.zeros((T, E, R), dtype=t.bool, device=self.dev)
-        teacher_action_store = t.zeros((T, E, R, 4), dtype=t.long, device=self.dev)
-        teacher_action_store[..., :3] = 1  # neutral categorical labels by default
-        teacher_mask_store = t.zeros((T, E, R), dtype=t.bool, device=self.dev)
+        # Grow trajectory buffers only as the battle actually lasts. Allocating the
+        # full horizon up-front wastes several GiB when most arenas end by elimination.
+        # Buffers grow geometrically (256, 512, 1024, ...), capped at the requested
+        # horizon, so the policy horizon is unchanged and there is no per-step allocation.
+        capacity = max(1, min(T, 256))
+        stores = {
+            "obs": t.zeros((capacity, E, R, e.OBS_SIZE), dtype=t.float32, device=self.dev),
+            # Action labels are categorical values 0..2 plus fire 0/1; uint8 is enough.
+            "actions": t.zeros((capacity, E, R, 4), dtype=t.uint8, device=self.dev),
+            "logp": t.zeros((capacity, E, R), dtype=t.float32, device=self.dev),
+            "values": t.zeros((capacity, E, R), dtype=t.float32, device=self.dev),
+            "rewards": t.zeros((capacity, E, R), dtype=t.float32, device=self.dev),
+            "valid": t.zeros((capacity, E, R), dtype=t.bool, device=self.dev),
+            "done": t.zeros((capacity, E, R), dtype=t.bool, device=self.dev),
+            "teacher_actions": t.zeros((capacity, E, R, 4), dtype=t.uint8, device=self.dev),
+            "teacher_mask": t.zeros((capacity, E, R), dtype=t.bool, device=self.dev),
+        }
+        stores["teacher_actions"][..., :3] = 1  # neutral categorical labels by default
+        self.last_record_buffer_capacity = capacity
+
+        def update_buffer_metrics():
+            self.last_record_buffer_capacity = int(capacity)
+            self.last_record_store_bytes = int(sum(
+                int(buf.numel()) * int(buf.element_size()) for buf in stores.values()
+            ))
+
+        def ensure_buffer_capacity(required: int):
+            nonlocal capacity
+            if required <= capacity:
+                return
+            target = min(T, max(int(required), capacity * 2))
+            old_capacity = capacity
+            # Resize one buffer at a time. Holding both entire old/new dictionaries
+            # at once would defeat the memory savings during a capacity increase.
+            for name in tuple(stores.keys()):
+                old = stores[name]
+                new_shape = (target, *old.shape[1:])
+                grown = t.zeros(new_shape, dtype=old.dtype, device=self.dev)
+                grown[:old_capacity].copy_(old)
+                stores[name] = grown
+                del old, grown
+            capacity = target
+            update_buffer_metrics()
+
+        update_buffer_metrics()
         # Reuse a graph already captured by diagnostics/tests for this exact batch
         # instance. In normal training each rollout owns a fresh batch, so graph
         # capture still happens once per rollout; avoiding a duplicate capture here
@@ -1135,28 +1168,29 @@ class GPUVectorArenaBatch:
             if horizon:
                 done = done | self.active_env[:, None]
                 self.active_env[:] = False
-            obs_store[decision].copy_(obs[:, :R])
-            act_store[decision].copy_(acts[:, :R])
-            logp_store[decision].copy_(logp[:, :R])
-            value_store[decision].copy_(values[:, :R])
-            reward_store[decision].copy_(reward[:, :R])
-            teacher_action_store[decision].copy_(teacher_actions[:, :R])
+            ensure_buffer_capacity(decision + 1)
+            stores["obs"][decision].copy_(obs[:, :R])
+            stores["actions"][decision].copy_(acts[:, :R])
+            stores["logp"][decision].copy_(logp[:, :R])
+            stores["values"][decision].copy_(values[:, :R])
+            stores["rewards"][decision].copy_(reward[:, :R])
+            stores["teacher_actions"][decision].copy_(teacher_actions[:, :R])
             if self.opponent_mode == "heuristic":
-                teacher_mask_store[decision].copy_(valid[:, :R] & (self.team[:, :R] == 0))
+                stores["teacher_mask"][decision].copy_(valid[:, :R] & (self.team[:, :R] == 0))
             elif self.opponent_mode == "selfplay":
-                teacher_mask_store[decision].copy_(valid[:, :R])
-            valid_store[decision].copy_(valid[:, :R])
-            done_store[decision].copy_(done[:, :R])
+                stores["teacher_mask"][decision].copy_(valid[:, :R])
+            stores["valid"][decision].copy_(valid[:, :R])
+            stores["done"][decision].copy_(done[:, :R])
             steps_done = decision + 1
         if steps_done == 0:
             return []
-        obs_t = obs_store[:steps_done]
-        act_t = act_store[:steps_done]
-        logp_t = logp_store[:steps_done]
-        value_t = value_store[:steps_done]
-        rewards = reward_store[:steps_done]
-        valid_t = valid_store[:steps_done]
-        dones_t = done_store[:steps_done]
+        obs_t = stores["obs"][:steps_done]
+        act_t = stores["actions"][:steps_done]
+        logp_t = stores["logp"][:steps_done]
+        value_t = stores["values"][:steps_done]
+        rewards = stores["rewards"][:steps_done]
+        valid_t = stores["valid"][:steps_done]
+        dones_t = stores["done"][:steps_done]
         # Terminal score mirrors the scalar Arena rollout objective.
         blue_alive = ((self.team == 0) & self.alive).sum(dim=1).float()
         red_alive = ((self.team == 1) & self.alive).sum(dim=1).float()
@@ -1234,8 +1268,8 @@ class GPUVectorArenaBatch:
             except Exception:
                 cuda_end = None
 
-        teacher_act_t = teacher_action_store[:steps_done]
-        teacher_mask_t = teacher_mask_store[:steps_done]
+        teacher_act_t = stores["teacher_actions"][:steps_done]
+        teacher_mask_t = stores["teacher_mask"][:steps_done]
         tensors_for_host = (valid_t, obs_t, act_t, logp_t, value_t, rewards,
                             dones_t, adv_t, ret_t, teacher_act_t, teacher_mask_t, summary_tensor)
         if self.dev.type == "cuda":

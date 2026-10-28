@@ -10,7 +10,7 @@ import gravitruex_ai as G
 
 def main():
     assert G.GPU_MAX_ARENAS == 4096
-    assert G.GPU_ROLLOUT_RECORD_BUDGET == 360000
+    assert G.GPU_ROLLOUT_RECORD_BUDGET == 720000
     assert G.next_gpu_arena_fallback(4096) == 3840
     assert G.next_gpu_arena_fallback(3072) == 2816
     assert G.next_gpu_arena_fallback(3840) == 3584

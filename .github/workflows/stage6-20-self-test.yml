@@ -1,0 +1,32 @@
+name: Stage 6.20 self-test
+
+on:
+  push:
+    branches:
+      - stage6-20-rollout-memory-optimization
+  pull_request:
+    branches:
+      - stage6-19-long-horizon-no-target-distance
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install base dependencies
+        run: python -m pip install --upgrade pip numpy psutil
+      - name: Install CPU PyTorch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Compile Python sources
+        run: python -m py_compile gravitruex_ai.py gravitruex_gpu_batch.py
+      - name: Run application self-test
+        run: python gravitruex_ai.py --self-test

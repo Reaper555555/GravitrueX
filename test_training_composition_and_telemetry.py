@@ -62,6 +62,8 @@ def main() -> int:
         assert row["gpu_batch_budget_reduced_arenas"] == 1748
         assert row["gpu_record_budget"] == 540_000
         assert row["gpu_max_decisions_per_arena"] == 720
+        assert "CUDA allocator MiB:" in report
+        assert "Rollout buffers:" in report
 
         # A CPU-only cycle must not claim GPU arenas were active just because a GPU
         # arena count is configured in the UI for a future GPU mode.

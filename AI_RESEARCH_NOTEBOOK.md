@@ -122,3 +122,109 @@ A functional “inner loop” with memory, priorities, simulated affect and shor
 ## 8. Decision rule
 
 Do not pursue architecture because it sounds more human-like. Pursue it if a controlled evaluation shows an improvement in tactical behaviour, robustness, learning speed, memory efficiency, or debuggability. The target is a better game agent; “brain-like” is a source of hypotheses, not a performance guarantee.
+
+
+## 9. New research direction: a minimal persistent cognitive agent (“proto-personality”)
+
+**Motivation:** The goal is to test whether a small, modular system can develop a coherent, adaptive behaviour pattern over time—not to assume that a particular neural network size or diagram can create consciousness. The most useful first target is a persistent agent with memory, goals, self-monitoring, learning and a stable behavioural identity.
+
+### Hard epistemic boundary: there is no validated minimum architecture for consciousness
+
+As of October 2026, consciousness research has no agreed theory that establishes a small set of computational components as both necessary and sufficient for subjective experience. Global Neuronal Workspace Theory, recurrent-processing theories, higher-order approaches, Integrated Information Theory, predictive processing and memory-based approaches disagree about key requirements. A 2026 integrative review explicitly notes that the minimum complexity threshold and the relevant organizational properties remain unsettled. Butlin et al. (published online November 2025; journal issue June 2026) propose evaluating AI through theory-derived indicators, while stressing that the indicators are not individually necessary or jointly proven sufficient.
+
+Therefore:
+- Do not claim that adding memory, an inner loop, emotions, a self-model or a workspace creates consciousness.
+- Distinguish **functional agency** (the system observes, chooses, acts, remembers and adapts), **proto-personality** (stable preferences and behavioural tendencies over time), and **phenomenal consciousness** (subjective experience).
+- The first two are tractable engineering goals with observable tests. The third remains an open scientific/philosophical question.
+- “Minimum necessary” should be treated as a research question and ablation programme, not as a known recipe.
+
+### Smallest practical architecture worth trying
+
+Avoid beginning with a huge Transformer, many layers, or five independently trained networks. Start with a modest recurrent core plus explicit state and memory. The system can use ordinary program logic for bookkeeping and a small trainable model for decisions; not every function needs to be another neural net.
+
+**A. Perception / world state.** Convert current observations into a compact structured state: what is happening, what is uncertain, what changed, and which entities/events matter. For a simple simulation this can be numeric features plus a short event list; in a richer environment it can be a learned encoder.
+
+**B. Recurrent working core.** A small GRU (or LSTM) receives the current state, the previous internal state, the active goal, relevant retrieved memories, and feedback on the last action. It returns an updated hidden state. This is the candidate for integrating information across time; it is not itself evidence of consciousness. A small starting experiment might use one GRU layer with 128–256 hidden units, but this is a tunable engineering baseline—not a theoretically sufficient size.
+
+**C. Shared workspace / attention selection.** Keep a compact “currently relevant” record that selected modules can read and write: current situation summary, active goal, main uncertainty, current plan, important memory retrieved, and last action result. An attention/selection mechanism decides what deserves this shared workspace, and the selected information is available to the planner, action policy and self-monitor. It may initially be a deterministic top-K selector; learnable attention can come later.
+
+**D. Persistent goal stack and value signals.** Store one long-term objective, a few subgoals, priorities, constraints and termination conditions. Numeric drive/affect-like variables may represent urgency, threat, curiosity, confidence, fatigue/resource pressure or recent failure. These values should have explicit update rules and observable effects on decisions. They are functional control signals—not claims of felt emotion. Avoid unconstrained goal rewriting; require reasons/evidence for switching goals and use hysteresis to prevent oscillation.
+
+**E. Self-model and world model.** Track what the agent can do, its resource/health state, its current skills and uncertainty, what it believes about the environment, and what outcome it predicts for a candidate action. Initially, predictions can be simple learned estimates or explicit simulation; later, test a learned dynamics/world model. Self-reports should be checked against actual logs so the agent can be wrong about itself and correct that belief using evidence.
+
+**F. Action selection and hierarchical planning.** A low-level policy handles immediate actions. A slower planner selects a goal/option and may simulate a few candidate outcomes, then return control to the policy. The high-level process should run less often than the motor loop. Start with a handful of behaviours/options instead of unconstrained open-ended planning.
+
+**G. Working and episodic memory.** Working memory holds the present task, intention, recent events and countdowns. Episodic memory stores compact event records: situation, chosen action, predicted result, actual result, lesson/uncertainty, and context. Retrieval returns a few relevant records, not the whole lifetime log. Persistent memory should be versioned, editable and logged so corrupted or contradictory memory can be diagnosed.
+
+**H. Metacognitive monitor.** Compare predictions with outcomes; track confidence calibration, repeated failure, stuck loops, uncertainty and contradictions. When necessary, request another observation, retrieve a memory, change strategy or defer to a safe fallback. A monitor that merely generates convincing explanations without checking evidence does not count.
+
+**I. Learning and consolidation.** Store experience continuously, but update policy/model weights in controlled training windows, validate against old tasks and keep checkpoints. The system can consolidate repeated events into a more general rule or skill, but a saved memory, a verbal reflection, and a genuine improvement in policy performance are three different things.
+
+### Minimal data flow
+
+At every decision cycle:
+
+1. Observe the world and record relevant new events.
+2. Update beliefs, uncertainty and the agent’s own state estimate.
+3. Retrieve relevant memories and update working state.
+4. Update priority/drive signals and decide whether to keep or revise the active goal.
+5. If needed, run a higher-level planning step; otherwise continue the active plan.
+6. Choose an action; record the prediction/rationale in a compact structured form.
+7. Act, then compare the actual result with the predicted result.
+8. Update immediate memory and evaluation signals; schedule controlled learning/consolidation separately.
+
+This is a recurrent feedback architecture, not a requirement to generate a stream of inner-language narration on every frame. Natural-language self-dialogue could be added later as an interface, but it is expensive and can create the illusion of introspection without improving decisions.
+
+### What would count as a useful “personality” in this project?
+
+Define personality operationally as **persistent, measurable behavioural tendencies that are learned or deliberately configured, influence decisions across episodes, and remain coherent under changing circumstances**. Potential dimensions include risk tolerance, exploration preference, loyalty/escort priority, curiosity, patience, or preference for preserving resources. Keep a separation between:
+- stable baseline preferences / values;
+- transient affect-like state;
+- temporary task goals;
+- learned skills and facts;
+- uncertainty and current beliefs.
+
+A system should not be assigned a trait merely because it says it has one. Verify it by behaviour. For example, if it claims to be cautious, controlled tests should show that it accepts less risk under comparable conditions while still pursuing goals. Its traits may evolve through training, but changes should be measured and reversible.
+
+### Lowest-effort prototype plan
+
+**P0 — environment and logging.** Use a tiny, fast environment with partial observability, delayed consequences, a few meaningful resources, and repeated episodes. Start with a minimal grid-world or simple 2D arena, not the full GravitrueX combat pipeline. Save every observation, goal, memory retrieval, action, prediction, outcome and model version.
+
+**P1 — baseline agent.** Train a small recurrent actor-critic or GRU policy; compare it against a feed-forward policy with the same parameter budget. The recurrent agent should only win if history actually helps. Keep a clean evaluation suite and fixed seeds.
+
+**P2 — explicit memory and goals.** Add a goal stack and compact episodic store. Give the agent tasks where a remembered key/location, previous failure, or delayed objective is useful. Test retrieval and goal persistence independently of model size.
+
+**P3 — self-monitor and simple internal drives.** Add uncertainty, repeated-failure and urgency signals that alter behaviour in predefined ways. Ablate each variable to see whether it improves results rather than simply making logs more expressive.
+
+**P4 — adaptation and consolidation.** Allow a controlled learning update between episodes, then evaluate old tasks to detect forgetting. Keep an immutable original checkpoint and compare adapted vs. non-adapted agents.
+
+**P5 — gradual complexity.** Only after P0–P4 demonstrate real gains, add a learned world model, more powerful planner, specialist modules, language interface or broader environment. Do not scale model size until a controlled ablation shows that capacity is the bottleneck.
+
+### Acceptance tests: prove capability, not a consciousness claim
+
+- **Delayed-goal test:** can the agent return to an earlier objective after an interruption?
+- **Memory test:** does a relevant stored episode improve choices on a new but related situation?
+- **Learning test:** after repeated failure and a learning update, does the failure rate decrease on held-out seeds?
+- **Counterfactual prediction test:** does the agent’s predicted outcome correlate with what actually happens?
+- **Self-model calibration:** when it estimates a high/low chance of success, do observed outcomes support that calibration?
+- **Consistency test:** do stable traits influence behaviour across varied contexts without turning into rigid rules?
+- **Transfer test:** does a learned rule help in a related environment with changed surface details?
+- **Forgetting/regression test:** does new learning preserve prior competence?
+- **Ablations:** remove recurrence, memory, goal persistence, self-monitor or drive signals one at a time. This tests which components actually contribute.
+- **No-personality-theatre test:** compare logged actions and decisions, not the agent’s verbal claims about what it supposedly feels or remembers.
+
+Success on these tests would establish useful functional capacities and a coherent agent. None would by itself establish subjective experience.
+
+### Decision for GravitrueX versus a separate prototype
+
+Do not directly splice a cognitive architecture into the current large PPO model while its performance and telemetry are still being stabilized. Keep the notebook as the shared design reference, finish the current training baseline first, and build a small sandbox prototype alongside it. Once the memory/goal loop is demonstrated, selected mechanisms—persistent target/intent memory, a tactical goal selector, recurrent policy, or meta-monitor—can be ported into GravitrueX one at a time.
+
+### Research references for this direction
+
+- Butlin et al., “Identifying indicators of consciousness in AI systems,” *Trends in Cognitive Sciences* 30(6), 2026; online 10 Nov 2025. https://doi.org/10.1016/j.tics.2025.10.011
+- Butlin et al., “Consciousness indicators, mimicry, and internal variants,” *Trends in Cognitive Sciences*, July 2026. https://doi.org/10.1016/j.tics.2026.04.006
+- Whyte et al., “On the minimal theory of consciousness implicit in active inference,” *Physics of Life Reviews* 56, 2026. https://doi.org/10.1016/j.plrev.2025.11.002
+- “Consciousness in the Brain: An Integrative Review of Contemporary Theories,” *Brain Sciences* 16(7), 2026. https://doi.org/10.3390/brainsci16070745
+- Soar cognitive architecture manual (working memory, production/semantic memory, preferences, decision cycle, learning): https://soar.eecs.umich.edu/soar_manual/02_TheSoarArchitecture/
+- Cognitive architecture of anticipatory thinking, *AI Magazine* (perception, working/long-term memory, decisions, learning and action): https://doi.org/10.1002/aaai.12102
+- Bayesian theories of consciousness review (predictive processing / active inference; a theoretical position, not established consensus): https://doi.org/10.1093/nc/niab038

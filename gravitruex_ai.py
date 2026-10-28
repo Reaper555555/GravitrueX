@@ -2449,7 +2449,8 @@ class Trainer(threading.Thread):
         self._last_rollout_wall_seconds = 0.0
         self.stats = {
             "episodes": 0, "wins": 0, "losses": 0, "draws": 0,
-            "win_rate_20": 0.0, "mean_reward_20": 0.0, "last_loss": 0.0,
+            "win_rate_20": 0.0, "mean_reward_20": 0.0,
+            "cycle_reward_total": 0.0, "cycle_mean_reward": 0.0, "last_loss": 0.0,
             "blue_kills_20": 0.0, "red_kills_20": 0.0,
             "blue_survivors_20": 0.0, "red_survivors_20": 0.0,
             "opponent_mode": self.opponent_mode, "opponent_name": self.opponent_name,
@@ -2886,6 +2887,8 @@ class Trainer(threading.Thread):
                     "draws": sum(1 for x in win_window if x == 0.5),
                     "win_rate_20": sum(win_window) / len(win_window) if win_window else 0.0,
                     "mean_reward_20": sum(reward_window) / max(1, len(reward_window)),
+                    "cycle_reward_total": float(batch_reward),
+                    "cycle_mean_reward": float(batch_reward) / max(1, len(results)),
                     "blue_damage_20": sum(blue_damage_window) / max(1, len(blue_damage_window)),
                     "red_damage_20": sum(red_damage_window) / max(1, len(red_damage_window)),
                     "blue_shots_20": sum(blue_shots_window) / max(1, len(blue_shots_window)),
@@ -3639,6 +3642,8 @@ class Trainer(threading.Thread):
             "episodes_total": int(self.stats.get("episodes", 0)),
             "steps_total": int(self.stats.get("steps", 0)),
             "win_rate_20": round(float(self.stats.get("win_rate_20", 0.0)), 4),
+            "cycle_reward_total": round(float(batch_reward), 4),
+            "cycle_mean_reward": round(float(batch_reward) / max(1, len(results)), 4),
             "mean_reward_20": round(float(self.stats.get("mean_reward_20", 0.0)), 4),
             "blue_damage_20": round(float(self.stats.get("blue_damage_20", 0.0)), 3),
             "red_damage_20": round(float(self.stats.get("red_damage_20", 0.0)), 3),
@@ -3696,7 +3701,7 @@ class Trainer(threading.Thread):
             f"PPO: записей {record_count:,} · mini-batch {self.batch_size:,} · эпох {self.epochs} · loss {loss:.5f}",
             f"Combat bootstrap: aux-loss {float(getattr(self.policy, 'last_imitation_loss', 0.0)):.4f} · коэффициент {float(getattr(self.policy, 'last_imitation_coef', 0.0)):.4f} (0 к 900 обновлениям) · teacher fire weight {row['teacher_fire_pos_weight']:.1f}" if self.opponent_mode in ("heuristic", "selfplay") else "Imitation loss: отключён для противника-модели",
             f"Действия огня, последние 20: policy {row['policy_fire_rate_20']:.1%} · teacher {row['teacher_fire_rate_20']:.1%}",
-            f"Качество, последние 20: победы {row['win_rate_20']:.0%} · награда {row['mean_reward_20']:+.3f} · убийства B/R {row['blue_kills_20']:.2f}/{row['red_kills_20']:.2f} · выжившие B/R {row['blue_survivors_20']:.2f}/{row['red_survivors_20']:.2f} · выстрелы B/R {row.get('blue_shots_20', 0.0):.1f}/{row.get('red_shots_20', 0.0):.1f} · попадания B/R {row.get('blue_hit_rate_20', 0.0):.0%}/{row.get('red_hit_rate_20', 0.0):.0%} · урон B/R {row.get('blue_damage_20', 0.0):.1f}/{row.get('red_damage_20', 0.0):.1f}",
+            f"Качество, последние 20: победы {row['win_rate_20']:.0%} · reward цикла Σ={row['cycle_reward_total']:+.2f} · средняя/цикл={row['cycle_mean_reward']:+.3f} · средняя 20 эп.={row['mean_reward_20']:+.3f} · убийства B/R {row['blue_kills_20']:.2f}/{row['red_kills_20']:.2f} · выжившие B/R {row['blue_survivors_20']:.2f}/{row['red_survivors_20']:.2f} · выстрелы B/R {row.get('blue_shots_20', 0.0):.1f}/{row.get('red_shots_20', 0.0):.1f} · попадания B/R {row.get('blue_hit_rate_20', 0.0):.0%}/{row.get('red_hit_rate_20', 0.0):.0%} · урон B/R {row.get('blue_damage_20', 0.0):.1f}/{row.get('red_damage_20', 0.0):.1f}",
             "",
             "ДВА ПОСЛЕДНИХ ЦИКЛА:",
         ]
@@ -3707,7 +3712,7 @@ class Trainer(threading.Thread):
             lines.append("Ресурсы UI snapshot: " + " · ".join(
                 f"{key}={value}" for key, value in resources.items()))
         for i, item in enumerate(reversed(self._stage_history), 1):
-            lines.append(f"{i}. {item['time']} | CPU-сбор {item['cpu_seconds']:.2f}с, {item['cpu_episodes']} эп., {item['cpu_steps_per_sec']:,.0f} phys.step/с | GPU-сбор {item['gpu_seconds']:.2f}с, {item['gpu_episodes']} эп., {item['gpu_steps_per_sec']:,.0f} phys.step/с | GPU arenas {item.get('gpu_batch_actual_envs', 0)}/{item.get('gpu_batch_requested_envs', 0)} | PPO {item['ppo_seconds']:.2f}с | wall {item['rollout_wall_seconds'] + item['ppo_seconds']:.2f}с | full {item.get('end_to_end_steps_per_sec', item['combined_steps_per_sec']):,.0f} phys.step/с")
+            lines.append(f"{i}. {item['time']} | reward Σ {item.get('cycle_reward_total', 0.0):+.2f} · средняя/цикл {item.get('cycle_mean_reward', 0.0):+.3f} · средняя 20 эп. {item.get('mean_reward_20', 0.0):+.3f} | CPU-сбор {item['cpu_seconds']:.2f}с, {item['cpu_episodes']} эп., {item['cpu_steps_per_sec']:,.0f} phys.step/с | GPU-сбор {item['gpu_seconds']:.2f}с, {item['gpu_episodes']} эп., {item['gpu_steps_per_sec']:,.0f} phys.step/с | GPU arenas {item.get('gpu_batch_actual_envs', 0)}/{item.get('gpu_batch_requested_envs', 0)} | PPO {item['ppo_seconds']:.2f}с | wall {item['rollout_wall_seconds'] + item['ppo_seconds']:.2f}с | full {item.get('end_to_end_steps_per_sec', item['combined_steps_per_sec']):,.0f} phys.step/с")
         lines += ["", f"Компактный диагностический TXT на рабочем столе: {resolve_desktop_diagnostic_path()}",
                   "Подробные JSONL остаются рядом с моделью; для первичного разбора достаточно компактного TXT."]
         try:
@@ -4018,13 +4023,13 @@ class GravitrueXApp:
         # Training composition is intentionally separate from the visible battle roster.
         self.train_blue_n = tk.IntVar(value=1)
         self.train_red_n = tk.IntVar(value=1)
-        self.train_record_budget = tk.StringVar(value="360 000")
+        self.train_record_budget = tk.StringVar(value="720 000")
         profile_name = next((name for name, dims in ARCH_PROFILES.items() if dims == (saved_width, saved_depth)), "Тактическая 1536×4 (~7,3 млн)")
         self.model_profile = tk.StringVar(value=profile_name)
         self.training_reward_mode = tk.StringVar(value="По профилю модели")
         self.training_priors_mode = tk.StringVar(value="По профилю модели")
         self.training_desired_range = tk.StringVar(value="480")
-        self.train_horizon = tk.StringVar(value="720")
+        self.train_horizon = tk.StringVar(value="2700 (180 с)")
         self._visible_test_horizon = None
         self._test_battle_active = False
         self._test_battle_start_step = 0
@@ -4448,7 +4453,7 @@ class GravitrueXApp:
         kpi_specs = [
             ("updates", "PPO ОБНОВЛЕНИЯ / ЭПИЗОДЫ", "0 обновлений · 0 эп."),
             ("steps", "СКОРОСТЬ / ШАГИ", "— шаг/с · 0 шагов"),
-            ("reward", "НАГРАДА / LOSS", "reward — · loss —"),
+            ("reward", "НАГРАДА / СРЕДНЯЯ", "Σ reward — · avg/cycle — · avg20 — · loss —"),
             ("win", "ПОБЕДЫ · ПОСЛЕДНИЕ 20", "—% · W/D/L —/—/—"),
             ("fire", "СТРЕЛЬБА / ПОПАДАНИЯ", "— выстр./бой · попадания —"),
             ("kills", "УБИЙСТВА / УРОН", "— убийств/бой · урон —"),
@@ -6284,7 +6289,7 @@ class GravitrueXApp:
             stats = self.trainer.get_stats()
             labels["train"].set(f"Обучение {stats.get('training_model_name', self.trainer.model_name)}: {stats.get('episodes', 0)} эпизодов · {stats.get('steps', 0):,} физ. шагов · противник: {stats.get('opponent_name', self.trainer.opponent_name)}")
             labels["win"].set(f"Последние 20: {stats.get('wins', 0)} побед / {stats.get('draws', 0)} ничьих / {stats.get('losses', 0)} поражений")
-            labels["reward"].set(f"Средняя награда: {stats.get('mean_reward_20', 0):+.3f}")
+            labels["reward"].set(f"Reward цикла Σ {stats.get('cycle_reward_total', 0):+.1f} · средняя/цикл {stats.get('cycle_mean_reward', 0):+.3f} · средняя 20 эп. {stats.get('mean_reward_20', 0):+.3f}")
             labels["loss"].set(f"PPO loss: {stats.get('last_loss', 0):.4f}")
             labels["accuracy"].set(f"Попадания: {stats.get('blue_hit_rate_20', 0):.0%} · {stats.get('blue_shots_20', 0):.1f} выстр./бой")
             labels["damage"].set(f"Урон за бой: синие {stats.get('blue_damage_20', 0):.1f} / красные {stats.get('red_damage_20', 0):.1f}")
@@ -6296,7 +6301,7 @@ class GravitrueXApp:
         else:
             labels["train"].set("Обучение: не запущено")
             labels["win"].set("Результат последних боёв: —")
-            labels["reward"].set("Средняя награда: —")
+            labels["reward"].set("Reward цикла / средняя награда: —")
             labels["loss"].set("PPO loss: —")
             labels["accuracy"].set("Попадания: —")
             labels["damage"].set("Урон за бой: —")
@@ -6325,7 +6330,7 @@ class GravitrueXApp:
                 f"CPU {compact_rate(cpu_rollout_rate)}/с · {latest_cpu_sec:.1f}с\n"
                 f"GPU {compact_rate(gpu_rollout_rate)}/с · {latest_gpu_sec:.1f}с\n"
                 f"Полный цикл {compact_rate(full_cycle_rate)}/с")
-            values["reward"].set(f"{stats.get('mean_reward_20', 0):+.3f} reward · {stats.get('last_loss', 0):.4f} loss")
+            values["reward"].set(f"Σ {stats.get('cycle_reward_total', 0):+.1f} · avg/cycle {stats.get('cycle_mean_reward', 0):+.3f} · avg20 {stats.get('mean_reward_20', 0):+.3f}\nloss {stats.get('last_loss', 0):.4f}")
             win_rate = float(stats.get("win_rate_20", 0.0)) * 100.0
             values["win"].set(f"{win_rate:.0f}% · W/D/L {stats.get('wins', 0)}/{stats.get('draws', 0)}/{stats.get('losses', 0)}")
             values["fire"].set(f"{stats.get('blue_shots_20', 0):.1f} выстр./бой · hit {stats.get('blue_hit_rate_20', 0):.0%} · policy {stats.get('policy_fire_rate_20', 0):.0%}")
@@ -6351,7 +6356,8 @@ class GravitrueXApp:
                 var.set(
                     f"{stamp or '—'} · CPU {compact_rate(cpu_rate)}/с {cpu_sec:.1f}с/{cpu_ep} эп. · "
                     f"GPU {compact_rate(gpu_rate)}/с {gpu_sec:.1f}с/{gpu_ep} эп.\n"
-                    f"GPU-арены {envs}/{requested_envs} · PPO {ppo_sec:.2f}с · {records:,} записей · цикл {compact_rate(full_rate)}/с")
+                    f"GPU-арены {envs}/{requested_envs} · PPO {ppo_sec:.2f}с · {records:,} записей · цикл {compact_rate(full_rate)}/с\n"
+                    f"Reward Σ {float(item.get('cycle_reward_total', 0) or 0):+.1f} · avg/cycle {float(item.get('cycle_mean_reward', 0) or 0):+.3f} · avg20 {float(item.get('mean_reward_20', 0) or 0):+.3f}")
             if hasattr(self, "training_dashboard_status"):
                 phase = str(stats.get("phase", "Обучение не запущено"))
                 note = str(stats.get("auto_rollout_selection_note", "") or "")

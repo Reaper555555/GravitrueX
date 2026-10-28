@@ -32,7 +32,7 @@ jobs:
         run: |
           python -m py_compile gravitruex_ai.py gravitruex_gpu_batch.py test_*.py check_ui_layout_smoke.py
 
-      - name: Prepare clean Stage 6.18 base package with Stage 6.19 source
+      - name: Prepare clean Stage 6.18 base package with Stage 6.20 source
         shell: bash
         run: |
           set -euo pipefail
@@ -85,7 +85,7 @@ jobs:
           xvfb-run -a python tests/test_battle_hp_shield_hud.py
           xvfb-run -a python tests/check_ui_layout_smoke.py
 
-      - name: Build clean Stage 6.19 ZIP
+      - name: Build clean Stage 6.20 ZIP
         shell: bash
         run: |
           set -euo pipefail

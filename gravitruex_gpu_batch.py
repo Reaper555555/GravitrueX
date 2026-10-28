@@ -935,15 +935,14 @@ class GPUVectorArenaBatch:
         reward = reward + .010 * (aim1.clamp_min(0) ** 2) * range_after
         finite_dist = t.isfinite(distance0) & t.isfinite(distance1)
         desired_range = float(getattr(e, "TRAINING_DESIRED_RANGE", 480.0))
-        before_p = (distance0 - desired_range).abs()
-        after_p = (distance1 - desired_range).abs()
-        # A missing target gives inf distances, and inf - inf is NaN. Replace the
-        # invalid distances with a large finite value before the subtraction so a
-        # dead opponent can never poison the reward with NaN.
-        safe_before = t.where(finite_dist, before_p, t.zeros_like(before_p))
-        safe_after = t.where(finite_dist, after_p, t.zeros_like(after_p))
-        reward = reward + .016 * t.clamp((safe_before - safe_after) / 30.0, -1, 1) * finite_dist.float()
-        # Previous coefficients made almost every plausible shot negative unless
+        if desired_range > 0.0:
+            before_p = (distance0 - desired_range).abs()
+            after_p = (distance1 - desired_range).abs()
+            # Missing targets yield infinite distances; mask before subtracting to avoid NaNs.
+            safe_before = t.where(finite_dist, before_p, t.zeros_like(before_p))
+            safe_after = t.where(finite_dist, after_p, t.zeros_like(after_p))
+            reward = reward + .016 * t.clamp((safe_before - safe_after) / 30.0, -1, 1) * finite_dist.float()
+                # Previous coefficients made almost every plausible shot negative unless
         # aim was nearly perfect, teaching the policy to suppress fire. Reward
         # moderately well-aimed shots while retaining a small blind-fire cost.
         shot_signal = (e.REWARD_SHOT_AIM_BONUS * (aim0.clamp_min(0) ** 2)

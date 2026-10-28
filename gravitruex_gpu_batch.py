@@ -1334,34 +1334,31 @@ class GPUVectorArenaBatch:
         teacher_act_np = teacher_act_cpu.numpy()
         teacher_mask_np = teacher_mask_cpu.numpy()
         summary_np = summary_cpu.numpy()
-        reward_slots = slice(None) if self.opponent_mode == "selfplay" else slice(0, 5)
-        episode_reward_np = reward_np[:, :, reward_slots].sum(axis=(0, 2))
-        # Pack every arena in one pass. The old code ran eight fancy-index copies
-        # per arena, which does not scale to hundreds of arenas.
+        # Each compact record column maps to one actual trainable ship. Summarize
+        # reward by arena and pack records in arena order without padding absent ships.
+        episode_reward_np = np.zeros(E, dtype=np.float32)
+        np.add.at(episode_reward_np, self.record_env_indices_np, reward_np.sum(axis=0))
         T_used = valid_np.shape[0]
-        # Pack every arena with one global selection instead of eight
-        # fancy-index copies per arena. The valid mask of a ship is a
-        # contiguous run along the time axis, so after transposing to
-        # (arena, time, ship) the records of one arena form one contiguous
-        # block. The contiguity is verified, and the slow path is used if a
-        # future change ever breaks it.
-        valid_env = valid_np.transpose(1, 0, 2)
+        valid_env = valid_np.T  # [trainable ship, time]
         contiguous_ok = bool(np.all(np.diff(valid_env.astype(np.int8), axis=1) >= 0))
         results = []
         if contiguous_ok:
-            counts = valid_env.sum(axis=(1, 2))
+            per_slot_counts = valid_env.sum(axis=1, dtype=np.int64)
+            counts = np.bincount(
+                self.record_env_indices_np, weights=per_slot_counts, minlength=E
+            ).astype(np.int64)
             offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
             sel = np.flatnonzero(valid_env.reshape(-1))
-            obs_sel = obs_np.transpose(1, 0, 2, 3).reshape(-1, e.OBS_SIZE)[sel]
-            act_sel = act_np.transpose(1, 0, 2, 3).reshape(-1, 4)[sel]
-            logp_sel = logp_np.transpose(1, 0, 2).reshape(-1)[sel]
-            value_sel = value_np.transpose(1, 0, 2).reshape(-1)[sel]
-            reward_sel = reward_np.transpose(1, 0, 2).reshape(-1)[sel]
-            done_sel = done_np.transpose(1, 0, 2).reshape(-1)[sel]
-            adv_sel = adv_np.transpose(1, 0, 2).reshape(-1)[sel]
-            ret_sel = ret_np.transpose(1, 0, 2).reshape(-1)[sel]
-            teacher_act_sel = teacher_act_np.transpose(1, 0, 2, 3).reshape(-1, 4)[sel]
-            teacher_mask_sel = teacher_mask_np.transpose(1, 0, 2).reshape(-1)[sel]
+            obs_sel = obs_np.transpose(1, 0, 2).reshape(-1, e.OBS_SIZE)[sel]
+            act_sel = act_np.transpose(1, 0, 2).reshape(-1, 4)[sel]
+            logp_sel = logp_np.T.reshape(-1)[sel]
+            value_sel = value_np.T.reshape(-1)[sel]
+            reward_sel = reward_np.T.reshape(-1)[sel]
+            done_sel = done_np.T.reshape(-1)[sel]
+            adv_sel = adv_np.T.reshape(-1)[sel]
+            ret_sel = ret_np.T.reshape(-1)[sel]
+            teacher_act_sel = teacher_act_np.transpose(1, 0, 2).reshape(-1, 4)[sel]
+            teacher_mask_sel = teacher_mask_np.T.reshape(-1)[sel]
         else:
             obs_sel = act_sel = logp_sel = value_sel = None
             reward_sel = done_sel = adv_sel = ret_sel = None
@@ -1382,18 +1379,20 @@ class GPUVectorArenaBatch:
                     teacher_mask=teacher_mask_sel[sl].astype(np.bool_, copy=False),
                 )
             else:
-                mask = valid_np[:, env_i, :]
+                slot_start = int(self.record_env_offsets[env_i])
+                slot_end = int(self.record_env_offsets[env_i + 1])
+                mask = valid_np[:, slot_start:slot_end]
                 packed = self.e.PackedExperience(
-                    obs_np[:, env_i][mask].astype(np.float32, copy=True),
-                    act_np[:, env_i][mask].astype(np.int64, copy=True),
-                    logp_np[:, env_i][mask].astype(np.float32, copy=True),
-                    value_np[:, env_i][mask].astype(np.float32, copy=True),
-                    reward_np[:, env_i][mask].astype(np.float32, copy=True),
-                    done_np[:, env_i][mask].astype(np.bool_, copy=True),
-                    adv_np[:, env_i][mask].astype(np.float32, copy=True),
-                    ret_np[:, env_i][mask].astype(np.float32, copy=True),
-                    teacher_action=teacher_act_np[:, env_i][mask].astype(np.int64, copy=True),
-                    teacher_mask=teacher_mask_np[:, env_i][mask].astype(np.bool_, copy=True),
+                    obs_np[:, slot_start:slot_end, :][mask].astype(np.float32, copy=True),
+                    act_np[:, slot_start:slot_end, :][mask].astype(np.int64, copy=True),
+                    logp_np[:, slot_start:slot_end][mask].astype(np.float32, copy=True),
+                    value_np[:, slot_start:slot_end][mask].astype(np.float32, copy=True),
+                    reward_np[:, slot_start:slot_end][mask].astype(np.float32, copy=True),
+                    done_np[:, slot_start:slot_end][mask].astype(np.bool_, copy=True),
+                    adv_np[:, slot_start:slot_end][mask].astype(np.float32, copy=True),
+                    ret_np[:, slot_start:slot_end][mask].astype(np.float32, copy=True),
+                    teacher_action=teacher_act_np[:, slot_start:slot_end, :][mask].astype(np.int64, copy=True),
+                    teacher_mask=teacher_mask_np[:, slot_start:slot_end][mask].astype(np.bool_, copy=True),
                 )
             (bshots, rshots, bdamage, rdamage, bkills, rkills,
              bs, rs, outv_f, steps_f) = summary_np[env_i]
@@ -1404,10 +1403,12 @@ class GPUVectorArenaBatch:
             outv = int(outv_f)
             out = None if outv < 0 else outv
             ep_reward = float(episode_reward_np[env_i])
-            env_valid = valid_np[:, env_i, :].astype(bool, copy=False)
-            env_fire = act_np[:, env_i, :, 3][env_valid]
-            env_teacher_mask = teacher_mask_np[:, env_i, :].astype(bool, copy=False) & env_valid
-            env_teacher_fire = teacher_act_np[:, env_i, :, 3][env_teacher_mask]
+            slot_start = int(self.record_env_offsets[env_i])
+            slot_end = int(self.record_env_offsets[env_i + 1])
+            env_valid = valid_np[:, slot_start:slot_end].astype(bool, copy=False)
+            env_fire = act_np[:, slot_start:slot_end, 3][env_valid]
+            env_teacher_mask = teacher_mask_np[:, slot_start:slot_end].astype(bool, copy=False) & env_valid
+            env_teacher_fire = teacher_act_np[:, slot_start:slot_end, 3][env_teacher_mask]
             policy_fire_rate = float(np.mean(env_fire)) if env_fire.size else 0.0
             teacher_fire_rate = float(np.mean(env_teacher_fire)) if env_teacher_fire.size else 0.0
             metrics = {

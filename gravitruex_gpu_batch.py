@@ -942,7 +942,7 @@ class GPUVectorArenaBatch:
             safe_before = t.where(finite_dist, before_p, t.zeros_like(before_p))
             safe_after = t.where(finite_dist, after_p, t.zeros_like(after_p))
             reward = reward + .016 * t.clamp((safe_before - safe_after) / 30.0, -1, 1) * finite_dist.float()
-                # Previous coefficients made almost every plausible shot negative unless
+        # Previous coefficients made almost every plausible shot negative unless
         # aim was nearly perfect, teaching the policy to suppress fire. Reward
         # moderately well-aimed shots while retaining a small blind-fire cost.
         shot_signal = (e.REWARD_SHOT_AIM_BONUS * (aim0.clamp_min(0) ** 2)
